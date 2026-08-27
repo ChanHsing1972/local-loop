@@ -35,6 +35,21 @@ BLOCKED_COMMANDS = {
 }
 BLOCKED_GIT_SUBCOMMANDS = {"clean", "commit", "push", "rebase", "reset", "restore"}
 SECRET_ENV_MARKERS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL")
+IGNORED_DIRECTORIES = {
+    ".git",
+    ".localloop",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".tox",
+    ".venv",
+    "__pycache__",
+    "build",
+    "dist",
+    "htmlcov",
+    "node_modules",
+}
+IGNORED_FILES = {".coverage", ".DS_Store"}
 
 
 class ToolError(RuntimeError):
@@ -183,7 +198,8 @@ class LocalTools:
             directories[:] = sorted(
                 name
                 for name in directories
-                if name not in {".git", ".localloop", "__pycache__", ".venv"}
+                if name not in IGNORED_DIRECTORIES
+                and not name.endswith(".egg-info")
                 and not name.startswith(".env")
             )
             if depth >= max_depth:
@@ -191,7 +207,11 @@ class LocalTools:
             for name in directories:
                 entries.append((current_path / name).relative_to(self.workspace).as_posix() + "/")
             for name in sorted(filenames):
-                if name == ".env" or (name.startswith(".env.") and name != ".env.example"):
+                if (
+                    name in IGNORED_FILES
+                    or name == ".env"
+                    or (name.startswith(".env.") and name != ".env.example")
+                ):
                     continue
                 entries.append((current_path / name).relative_to(self.workspace).as_posix())
             if len(entries) >= 500:
@@ -281,7 +301,8 @@ class LocalTools:
             directories[:] = [
                 name
                 for name in directories
-                if name not in {".git", ".localloop", ".venv", "__pycache__"}
+                if name not in IGNORED_DIRECTORIES
+                and not name.endswith(".egg-info")
                 and not name.startswith(".env")
             ]
             for name in filenames:

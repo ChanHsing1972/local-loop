@@ -121,6 +121,35 @@ def test_rejects_business_error_inside_json_string():
         provider.complete([], [])
 
 
+def test_retries_empty_string_response_then_succeeds():
+    sleeps = []
+    client = FakeClient(["", "   ", '"重试后成功。"'])
+    provider = OpenAIChatProvider(
+        api_key="secret",
+        base_url="https://example.test/v1",
+        model="model",
+        client=client,
+        max_retries=2,
+        sleeper=sleeps.append,
+    )
+    assert provider.complete([], []).content == "重试后成功。"
+    assert sleeps == [1, 2]
+
+
+def test_empty_string_response_exhausts_retries_with_clear_error():
+    client = FakeClient(["", ""])
+    provider = OpenAIChatProvider(
+        api_key="secret",
+        base_url="https://example.test/v1",
+        model="model",
+        client=client,
+        max_retries=1,
+        sleeper=lambda _seconds: None,
+    )
+    with pytest.raises(ProviderError, match="连续 2 次返回空响应"):
+        provider.complete([], [])
+
+
 class FakeHTTPResponse:
     def __init__(self, payload, status=200):
         self.payload = json.dumps(payload).encode()

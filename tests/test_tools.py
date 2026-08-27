@@ -37,12 +37,21 @@ def test_list_read_create_update_and_stale_write(tmp_path):
     target = tmp_path / "src" / "a.py"
     target.write_text("one\ntwo\n")
     (tmp_path / ".git").mkdir()
+    (tmp_path / ".pytest_cache").mkdir()
+    (tmp_path / "build").mkdir()
+    (tmp_path / "package.egg-info").mkdir()
     (tmp_path / ".env").write_text("secret")
+    (tmp_path / ".coverage").write_text("generated")
     tools = LocalTools(tmp_path, AlwaysApprovePolicy())
 
     listed = payload(tools.execute(make_call("list_files", {"path": ".", "max_depth": 2})))
     assert "src/a.py" in listed["entries"]
     assert not any(".git" in entry or entry == ".env" for entry in listed["entries"])
+    assert not any(
+        generated in entry
+        for entry in listed["entries"]
+        for generated in (".pytest_cache", "build", ".egg-info", ".coverage")
+    )
 
     read = payload(tools.execute(make_call("read_file", {"path": "src/a.py"})))
     assert read["content"] == "one\ntwo\n"
@@ -189,4 +198,3 @@ def test_denied_and_missing_command(tmp_path):
         make_call("run_command", {"args": ["definitely-not-a-command"]})
     )
     assert "not found" in missing.content
-

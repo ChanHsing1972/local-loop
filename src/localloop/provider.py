@@ -25,6 +25,10 @@ class ProviderError(RuntimeError):
     """经过脱敏、可直接展示给用户的模型接口错误。"""
 
 
+class _RetryableResponseError(ValueError):
+    """HTTP 成功但响应暂时不可用，可以安全重试。"""
+
+
 def _safe_error(error: BaseException, api_key: str) -> str:
     text = str(error).replace(api_key, "[REDACTED]")
     return text[:1_000]
@@ -84,6 +88,12 @@ class OpenAIChatProvider:
             except (APIConnectionError, APITimeoutError) as exc:
                 if attempt >= self.max_retries:
                     raise ProviderError(_safe_error(exc, self.api_key)) from exc
+            except _RetryableResponseError as exc:
+                if attempt >= self.max_retries:
+                    raise ProviderError(
+                        f"网关连续 {attempt + 1} 次返回空响应；"
+                        "请稍后重试，或使用 /model 切换模型"
+                    ) from exc
             except (AttributeError, TypeError, ValueError) as exc:
                 raise ProviderError(
                     "网关返回了不兼容的 Chat Completions 响应："
@@ -97,7 +107,7 @@ class OpenAIChatProvider:
         if isinstance(response, str):
             text = response.strip()
             if not text:
-                raise ValueError("响应是空字符串")
+                raise _RetryableResponseError("响应是空字符串")
             try:
                 decoded = json.loads(text)
             except json.JSONDecodeError:
