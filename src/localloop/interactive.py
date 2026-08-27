@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from dataclasses import replace
 from typing import Any
@@ -73,10 +74,20 @@ class InteractiveShell:
         self.approval_input = approval_input
         self.session: SessionStore | None = None
         self.messages: list[Message] | None = None
-        history_dir = config.workspace / ".localloop"
-        history_dir.mkdir(parents=True, exist_ok=True)
+        history_dir = (config.workspace / ".localloop").resolve(strict=False)
+        try:
+            history_dir.relative_to(config.workspace)
+        except ValueError as exc:
+            raise SessionError("输入历史目录不能通过符号链接越过工作区") from exc
+        history_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+        os.chmod(history_dir, 0o700)
+        history_path = history_dir / "input_history"
+        if history_path.is_symlink():
+            raise SessionError("输入历史文件不能是符号链接")
+        history_path.touch(mode=0o600, exist_ok=True)
+        os.chmod(history_path, 0o600)
         self.prompt_session = prompt_session or PromptSession(
-            history=FileHistory(str(history_dir / "input_history")),
+            history=FileHistory(str(history_path)),
             completer=WordCompleter(COMMANDS, sentence=True),
             complete_while_typing=False,
             style=Style.from_dict(

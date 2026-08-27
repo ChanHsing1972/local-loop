@@ -31,7 +31,12 @@ class SessionStore:
             raise SessionError("Invalid session id")
         self.workspace = workspace.resolve()
         self.session_id = session_id
-        self.directory = self.workspace / ".localloop" / "sessions"
+        raw_directory = self.workspace / ".localloop" / "sessions"
+        self.directory = raw_directory.resolve(strict=False)
+        try:
+            self.directory.relative_to(self.workspace)
+        except ValueError as exc:
+            raise SessionError("会话目录不能通过符号链接越过工作区") from exc
         self.path = self.directory / f"{session_id}.jsonl"
 
     @classmethod
@@ -51,12 +56,17 @@ class SessionStore:
     @classmethod
     def open(cls, workspace: Path, session_id: str) -> SessionStore:
         store = cls(workspace, session_id)
+        if store.path.is_symlink():
+            raise SessionError(f"Session path must not be a symbolic link: {session_id}")
         if not store.path.is_file():
             raise SessionError(f"Session not found: {session_id}")
         return store
 
     def append(self, kind: str, data: JsonObject) -> None:
-        self.directory.mkdir(parents=True, exist_ok=True)
+        self.directory.mkdir(parents=True, mode=0o700, exist_ok=True)
+        os.chmod(self.directory, 0o700)
+        if self.path.is_symlink():
+            raise SessionError("会话文件不能是符号链接")
         event = SessionEvent(
             version=SESSION_VERSION,
             kind=kind,
@@ -68,6 +78,7 @@ class SessionStore:
             stream.write(line + "\n")
             stream.flush()
             os.fsync(stream.fileno())
+        os.chmod(self.path, 0o600)
 
     def append_message(self, message: Message) -> None:
         self.append("message", {"message": message})

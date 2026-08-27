@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import stat
 
 import pytest
 
@@ -16,6 +17,8 @@ def test_session_round_trip(tmp_path):
     assert loaded.metadata["workspace_name"] == tmp_path.name
     assert [message["role"] for message in loaded.messages] == ["system", "user"]
     assert str(tmp_path.resolve()) not in store.path.read_text()
+    assert stat.S_IMODE(store.directory.stat().st_mode) == 0o700
+    assert stat.S_IMODE(store.path.stat().st_mode) == 0o600
 
 
 def test_invalid_and_missing_session(tmp_path):
@@ -68,3 +71,22 @@ def test_unsupported_version_and_invalid_message_are_rejected(tmp_path):
     )
     with pytest.raises(SessionError, match="Invalid message"):
         store.load()
+
+
+def test_session_storage_rejects_symlink_escape(tmp_path):
+    outside = tmp_path.parent / "outside-state"
+    outside.mkdir()
+    (tmp_path / ".localloop").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(SessionError, match="越过工作区"):
+        SessionStore.create(tmp_path, task="task", model="model")
+
+
+def test_session_file_rejects_symbolic_link(tmp_path):
+    session_id = "abcdef123456"
+    directory = tmp_path / ".localloop" / "sessions"
+    directory.mkdir(parents=True)
+    outside = tmp_path.parent / "outside-session.jsonl"
+    outside.write_text("keep", encoding="utf-8")
+    (directory / f"{session_id}.jsonl").symlink_to(outside)
+    with pytest.raises(SessionError, match="symbolic link"):
+        SessionStore.open(tmp_path, session_id)

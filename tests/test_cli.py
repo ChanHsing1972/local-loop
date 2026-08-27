@@ -5,6 +5,7 @@ import pytest
 from localloop.agent import create_new_session
 from localloop.cli import _parser, main
 from localloop.provider import ProviderError
+from localloop.session import SessionError
 from localloop.types import AssistantTurn, RunResult, RunStatus, ToolCall
 
 
@@ -180,6 +181,18 @@ def test_default_interactive_reports_missing_configuration(tmp_path, monkeypatch
     monkeypatch.delenv("LLM_API_KEY", raising=False)
     assert main(["--workspace", str(tmp_path)]) == 2
     assert "配置错误" in capsys.readouterr().err
+
+
+def test_default_interactive_reports_local_state_error(tmp_path, monkeypatch, capsys):
+    configured(monkeypatch)
+
+    class BrokenShell:
+        def __init__(self, _config):
+            raise SessionError("状态目录越界")
+
+    monkeypatch.setattr("localloop.cli.InteractiveShell", BrokenShell)
+    assert main(["--workspace", str(tmp_path)]) == 2
+    assert "本地状态错误" in capsys.readouterr().err
 
 
 def test_generated_help_is_chinese():

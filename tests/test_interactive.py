@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from io import StringIO
 
+import pytest
 from rich.console import Console
 
 from localloop.interactive import InteractiveShell
 from localloop.provider import ProviderError
+from localloop.session import SessionError
 from localloop.types import AgentConfig, AssistantTurn
 
 
@@ -163,3 +165,20 @@ def test_interactive_shell_displays_provider_error(tmp_path):
     rendered = output.getvalue()
     assert "运行错误" in rendered
     assert "网关响应格式异常" in rendered
+
+
+def test_interactive_history_rejects_symlink_escape(tmp_path):
+    outside = tmp_path.parent / "outside-history"
+    outside.mkdir()
+    (tmp_path / ".localloop").symlink_to(outside, target_is_directory=True)
+    config = AgentConfig(
+        api_key="fresh-key",
+        base_url="https://example.test/v1",
+        model="model-a",
+        workspace=tmp_path,
+    )
+    with pytest.raises(SessionError, match="越过工作区"):
+        InteractiveShell(
+            config,
+            provider_factory=lambda _config: FakeProvider(),
+        )

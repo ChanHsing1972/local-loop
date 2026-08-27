@@ -187,6 +187,9 @@ def _interactive(args: argparse.Namespace) -> int:
         return 2
     try:
         return InteractiveShell(config).run(initial_resume=args.resume)
+    except (SessionError, OSError) as exc:
+        print(f"本地状态错误：{exc}", file=sys.stderr)
+        return 2
     except KeyboardInterrupt:
         print("\n已退出 LocalLoop。")
         return 130
