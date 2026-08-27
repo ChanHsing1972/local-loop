@@ -72,9 +72,53 @@ def test_incompatible_response_is_sanitized():
     provider = OpenAIChatProvider(
         api_key="secret", base_url="https://example.test/v1", model="model", client=client
     )
-    with pytest.raises(ProviderError, match="incompatible") as error:
+    with pytest.raises(ProviderError, match="不兼容") as error:
         provider.complete([], [])
     assert "secret" not in str(error.value)
+
+
+def test_accepts_plain_text_and_json_string_gateway_responses():
+    plain = OpenAIChatProvider(
+        api_key="secret",
+        base_url="https://example.test/v1",
+        model="model",
+        client=FakeClient(["工具执行完成，已列出文件。"]),
+    )
+    assert plain.complete([], []).content == "工具执行完成，已列出文件。"
+
+    encoded = json.dumps(
+        {
+            "choices": [
+                {
+                    "message": {"content": "JSON 字符串响应正常。", "tool_calls": None},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"total_tokens": 9},
+        },
+        ensure_ascii=False,
+    )
+    provider = OpenAIChatProvider(
+        api_key="secret",
+        base_url="https://example.test/v1",
+        model="model",
+        client=FakeClient([encoded]),
+    )
+    turn = provider.complete([], [])
+    assert turn.content == "JSON 字符串响应正常。"
+    assert turn.finish_reason == "stop"
+    assert turn.usage == {"total_tokens": 9}
+
+
+def test_rejects_business_error_inside_json_string():
+    provider = OpenAIChatProvider(
+        api_key="secret",
+        base_url="https://example.test/v1",
+        model="model",
+        client=FakeClient(['{"code": 401, "msg": "bad auth"}']),
+    )
+    with pytest.raises(ProviderError, match="业务错误 401"):
+        provider.complete([], [])
 
 
 class FakeHTTPResponse:
@@ -117,4 +161,3 @@ def test_probe_models_business_error_and_bad_json(monkeypatch):
     monkeypatch.setattr("urllib.request.urlopen", lambda *_args, **_kwargs: bad)
     with pytest.raises(ProviderError, match="non-JSON"):
         probe_models(api_key="key", base_url="https://example.test/v1")
-

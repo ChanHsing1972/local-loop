@@ -4,7 +4,7 @@ import json
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from openai import (
@@ -86,7 +86,7 @@ class OpenAIChatProvider:
                     raise ProviderError(_safe_error(exc, self.api_key)) from exc
             except (AttributeError, TypeError, ValueError) as exc:
                 raise ProviderError(
-                    "The gateway returned an incompatible Chat Completions response: "
+                    "网关返回了不兼容的 Chat Completions 响应："
                     + _safe_error(exc, self.api_key)
                 ) from exc
             self.sleeper(min(2**attempt, 8))
@@ -94,36 +94,82 @@ class OpenAIChatProvider:
 
     @staticmethod
     def _parse_response(response: Any) -> AssistantTurn:
-        if not response.choices:
-            raise ValueError("response has no choices")
-        choice = response.choices[0]
-        message = choice.message
+        if isinstance(response, str):
+            text = response.strip()
+            if not text:
+                raise ValueError("响应是空字符串")
+            try:
+                decoded = json.loads(text)
+            except json.JSONDecodeError:
+                return AssistantTurn(content=text, finish_reason="stop")
+            if isinstance(decoded, str):
+                return AssistantTurn(content=decoded, finish_reason="stop")
+            response = decoded
+
+        if isinstance(response, Mapping):
+            OpenAIChatProvider._raise_payload_error(response)
+            choices = response.get("choices")
+        else:
+            choices = getattr(response, "choices", None)
+        if not choices:
+            raise ValueError("响应中没有 choices")
+        choice = choices[0]
+        message = OpenAIChatProvider._field(choice, "message")
+        if message is None:
+            raise ValueError("choice 中没有 message")
         calls: list[ToolCall] = []
-        for call in message.tool_calls or []:
-            if getattr(call, "type", "function") != "function":
-                raise ValueError(f"unsupported tool call type: {call.type}")
+        for call in OpenAIChatProvider._field(message, "tool_calls", []) or []:
+            call_type = OpenAIChatProvider._field(call, "type", "function")
+            if call_type != "function":
+                raise ValueError(f"不支持的工具调用类型：{call_type}")
+            function = OpenAIChatProvider._field(call, "function")
+            if function is None:
+                raise ValueError("工具调用中没有 function")
             calls.append(
                 ToolCall(
-                    id=call.id,
-                    name=call.function.name,
-                    arguments=call.function.arguments,
+                    id=str(OpenAIChatProvider._field(call, "id", "")),
+                    name=str(OpenAIChatProvider._field(function, "name", "")),
+                    arguments=str(
+                        OpenAIChatProvider._field(function, "arguments", "")
+                    ),
                 )
             )
         usage = None
-        if getattr(response, "usage", None) is not None:
-            raw_usage = response.usage
+        raw_usage = OpenAIChatProvider._field(response, "usage")
+        if raw_usage is not None:
             usage = (
                 raw_usage.model_dump(exclude_none=True)
                 if hasattr(raw_usage, "model_dump")
                 else dict(raw_usage)
             )
-        content = message.content if isinstance(message.content, str) else ""
+        raw_content = OpenAIChatProvider._field(message, "content", "")
+        content = raw_content if isinstance(raw_content, str) else ""
         return AssistantTurn(
             content=content,
             tool_calls=tuple(calls),
-            finish_reason=getattr(choice, "finish_reason", None),
+            finish_reason=OpenAIChatProvider._field(choice, "finish_reason"),
             usage=usage,
         )
+
+    @staticmethod
+    def _field(value: Any, name: str, default: Any = None) -> Any:
+        if isinstance(value, Mapping):
+            return value.get(name, default)
+        return getattr(value, name, default)
+
+    @staticmethod
+    def _raise_payload_error(payload: Mapping[str, Any]) -> None:
+        if "error" in payload:
+            error = payload["error"]
+            detail = error.get("message", error) if isinstance(error, Mapping) else error
+            raise ValueError(f"接口错误：{detail}")
+        if "code" in payload and str(payload["code"]).lower() not in {
+            "0",
+            "200",
+            "success",
+        }:
+            detail = payload.get("msg") or payload.get("message") or "未知业务错误"
+            raise ValueError(f"接口业务错误 {payload['code']}：{detail}")
 
 
 def probe_models(*, api_key: str, base_url: str, timeout: float = 15.0) -> list[str]:

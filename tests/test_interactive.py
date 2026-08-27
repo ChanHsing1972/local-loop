@@ -16,7 +16,10 @@ class FakeProvider:
 
     def complete(self, messages, tools, *, tool_choice="auto"):
         self.requests.append((list(messages), tools, tool_choice))
-        return AssistantTurn(self.answers.pop(0))
+        answer = self.answers.pop(0)
+        if isinstance(answer, BaseException):
+            raise answer
+        return AssistantTurn(answer)
 
 
 class ScriptedPrompt:
@@ -149,3 +152,14 @@ def test_eof_and_keyboard_interrupt_at_prompt(tmp_path):
 def test_invalid_initial_resume_stops(tmp_path):
     shell, _provider, _output = make_shell(tmp_path)
     assert shell.run(initial_resume="abcdef123456") == 2
+
+
+def test_interactive_shell_displays_provider_error(tmp_path):
+    shell, _provider, output = make_shell(
+        tmp_path,
+        answers=[ProviderError("网关响应格式异常")],
+    )
+    shell.submit_task("列出文件")
+    rendered = output.getvalue()
+    assert "运行错误" in rendered
+    assert "网关响应格式异常" in rendered

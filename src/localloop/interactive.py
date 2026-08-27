@@ -144,7 +144,14 @@ class InteractiveShell:
         lines.append(str(self.config.workspace) + "\n")
         lines.append("审批：", style="dim")
         lines.append(approval)
-        self.console.print(Panel(lines, title="交互式编程智能体", border_style="cyan"))
+        self.console.print(
+            Panel(
+                lines,
+                title="交互式编程智能体",
+                border_style="cyan",
+                expand=False,
+            )
+        )
         self.console.print("直接输入编程任务；输入 [cyan]/help[/cyan] 查看命令。")
 
     def submit_task(self, task: str) -> None:
@@ -169,6 +176,9 @@ class InteractiveShell:
         self.console.print(
             f"{label} · {result.steps} 步 · 会话 {result.session_id}", style=f"dim {style}"
         )
+        if result.status is not RunStatus.COMPLETED:
+            error_style = "bold red" if result.status is RunStatus.ERROR else "yellow"
+            self.console.print(result.final_output, style=error_style)
 
     def handle_command(self, line: str) -> bool:
         command, _, argument = line.partition(" ")
