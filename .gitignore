@@ -12,5 +12,5 @@ build/
 .env.*
 !.env.example
 .localloop/
+tmp/
 .DS_Store
-

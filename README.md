@@ -37,7 +37,7 @@ export LLM_BASE_URL='https://token.bayesdl.com/api/maas/v1'
 export LLM_MODEL='模型编号'
 ```
 
-首次使用前运行诊断命令。设置 `LLM_MODEL` 后，完整诊断会额外发送一次很小的请求，以验证模型是否能返回原生函数调用：
+首次使用前运行诊断命令。设置 `LLM_MODEL` 后，完整诊断会发送两次很小的请求：第一次验证模型能否发起原生函数调用，第二次验证工具结果回填后能否继续生成最终文本。诊断使用与正常 Agent 相同的 `tool_choice=auto`，兼容不允许强制工具调用的思考模型：
 
 ```bash
 localloop doctor --skip-tool-check
@@ -120,9 +120,10 @@ localloop --workspace /tmp/demo --auto-approve
 
 - Assistant 发起的工具调用会被完整保留，每个执行结果都会作为 `tool` 消息返回，并携带与原调用匹配的 call ID。
 - 参数错误、未知工具、命令失败和陈旧写入都会转换为结构化结果，使模型能够自行修正。
-- 超时、限流或服务器错误最多进行三次指数退避重试；认证失败和无效请求立即终止。
-- 每轮运行会在模型返回最终文本、达到步骤或时间限制、收到空响应、用户中断，或连续三次出现相同工具调用批次时停止。
+- 超时、限流、服务器错误或空响应最多进行三次指数退避重试；认证失败和无效请求立即终止。
+- 每轮运行会在模型返回最终文本、达到步骤或时间限制、空响应重试耗尽、用户中断，或连续三次出现相同工具调用批次时停止。
 - 完整事件保存在 `.localloop/sessions/*.jsonl`；旧上下文以完整工具交互组为单位进行确定性压缩，不需要第二次模型总结。
+- 会话事件写入后会同步落盘；恢复时可忽略崩溃留下的最后一条未写完事件，并为缺失结果的尾部工具调用补入明确错误，保证消息协议仍然有效。
 - API 密钥不会进入对象表示、会话记录、工具提示词或子进程环境。
 
 ## 测试
@@ -141,9 +142,11 @@ CI 会在 Python 3.11 和 3.12 上运行相同检查；真实 API 请求不会�
 `demo/price_project` 是一个故意包含金额精度和阈值边界问题的小项目。先复制到临时目录，保证仓库中的演示夹具不被修改：
 
 ```bash
-rm -rf /tmp/localloop-price-demo
-cp -R demo/price_project /tmp/localloop-price-demo
-cd /tmp/localloop-price-demo
+demo_root=$(mktemp -d /tmp/localloop-price-demo.XXXXXX)
+mkdir "$demo_root/project"
+cp demo/price_project/README.md demo/price_project/pricing.py \
+  demo/price_project/test_pricing.py "$demo_root/project/"
+cd "$demo_root/project"
 pytest -q
 localloop --auto-approve
 ```
@@ -169,6 +172,8 @@ LocalLoop 目前仅处理 UTF-8 文本，不支持模型输出流式传输，也
 - `tools.py`：工具 Schema、参数验证、本地执行与输出限制
 - `context.py`：确定性上下文压缩
 - `session.py`：带版本号、仅追加的 JSONL 会话记录
+
+重要设计决策与真实网关兼容问题的处理过程见 `docs/设计日志.md`。
 
 ## 许可证
 
