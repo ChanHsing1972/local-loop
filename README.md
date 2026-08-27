@@ -133,20 +133,18 @@ localloop --workspace /tmp/demo --auto-approve
 ```bash
 ruff check .
 pytest --cov=localloop --cov-report=term-missing --cov-fail-under=85
+python scripts/release_check.py
 ```
 
-CI 会在 Python 3.11 和 3.12 上运行相同检查；真实 API 请求不会进入 CI。
+CI 会在 Python 3.11 和 3.12 上运行相同检查，并读取完整 Git 历史执行秘密与材料审计；真实 API 请求不会进入 CI。
 
 ## 两分钟演示
 
 `demo/price_project` 是一个故意包含金额精度和阈值边界问题的小项目。先复制到临时目录，保证仓库中的演示夹具不被修改：
 
 ```bash
-demo_root=$(mktemp -d /tmp/localloop-price-demo.XXXXXX)
-mkdir "$demo_root/project"
-cp demo/price_project/README.md demo/price_project/pricing.py \
-  demo/price_project/test_pricing.py "$demo_root/project/"
-cd "$demo_root/project"
+demo_root=$(python scripts/prepare_demo.py)
+cd "$demo_root"
 pytest -q
 localloop --auto-approve
 ```
