@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import argparse
 import re
 import subprocess
 from pathlib import Path
+
+import httpx
 
 REPOSITORY = Path(__file__).resolve().parents[1]
 REQUIRED_FILES = {
@@ -22,6 +25,7 @@ SECRET_PATTERNS = {
     "私钥头": re.compile(rb"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
 }
 IDENTITY_PATH_PATTERN = re.compile(rb"/(?:Users|home)/[^/\s]+/")
+GITHUB_REPOSITORY_PATTERN = re.compile(r"https://github\.com/([^/\s]+)/([^/\s]+)")
 
 
 def git_bytes(*arguments: str) -> bytes:
@@ -45,7 +49,70 @@ def check_patterns(label: str, content: bytes, failures: list[str]) -> None:
         failures.append(f"{label}包含用户主目录绝对路径")
 
 
-def main() -> int:
+def check_online_repository(
+    readme_text: str,
+    failures: list[str],
+    *,
+    client: httpx.Client | None = None,
+) -> None:
+    match = GITHUB_REPOSITORY_PATTERN.search(readme_text)
+    if not match:
+        failures.append("在线检查目前只支持 README.txt 中的 GitHub 仓库地址")
+        return
+    owner, repository = match.groups()
+    repository = repository.removesuffix(".git")
+    owns_client = client is None
+    http_client = client or httpx.Client(timeout=15, follow_redirects=True)
+    headers = {"Accept": "application/vnd.github+json", "User-Agent": "LocalLoop-Release-Check"}
+    try:
+        try:
+            repository_response = http_client.get(
+                f"https://api.github.com/repos/{owner}/{repository}",
+                headers=headers,
+            )
+            profile_response = http_client.get(
+                f"https://api.github.com/users/{owner}",
+                headers=headers,
+            )
+        except httpx.HTTPError as exc:
+            failures.append(f"无法完成 GitHub 匿名检查：{exc}")
+            return
+    finally:
+        if owns_client:
+            http_client.close()
+    if repository_response.status_code != 200:
+        failures.append(
+            f"GitHub 仓库无法匿名读取（HTTP {repository_response.status_code}），"
+            "请确认已经设为公开"
+        )
+    else:
+        repository_payload = repository_response.json()
+        if repository_payload.get("private") is not False:
+            failures.append("GitHub 仓库仍被标记为非公开")
+    if profile_response.status_code != 200:
+        failures.append(f"无法匿名读取 GitHub 账号主页（HTTP {profile_response.status_code}）")
+        return
+    profile = profile_response.json()
+    identifying_fields = [
+        field
+        for field in ("name", "bio", "company", "location", "blog")
+        if profile.get(field)
+    ]
+    if identifying_fields:
+        failures.append(
+            "GitHub 账号公开资料仍填写了可能识别身份的字段："
+            + "、".join(identifying_fields)
+        )
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="检查仓库、历史、材料与双盲发布门槛")
+    parser.add_argument(
+        "--online",
+        action="store_true",
+        help="额外匿名检查 GitHub 仓库可见性与账号公开资料",
+    )
+    args = parser.parse_args(argv)
     failures: list[str] = []
     tracked = {
         item.decode("utf-8")
@@ -77,6 +144,8 @@ def main() -> int:
         failures.append("README.txt 仍含仓库地址占位符")
     if not re.search(r"https://(?:github\.com|gitee\.com)/\S+", readme_text):
         failures.append("README.txt 没有 GitHub 或 Gitee 仓库地址")
+    if args.online:
+        check_online_repository(readme_text, failures)
 
     authors = {
         line
