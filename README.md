@@ -1,29 +1,27 @@
 # LocalLoop
 
-LocalLoop is a small, auditable coding agent. It asks an OpenAI-compatible model what to do, validates each native function call, executes the requested operation locally, returns the result to the model, and repeats until the task is complete or a safety limit is reached. It does not use an agent framework or any server-hosted file or code-execution tool.
+LocalLoop 是一个小型、可审计的交互式编程智能体。启动后，它会像常见的终端编程智能体一样保持一个持续会话：用户可以直接输入任务、观察模型调用本地工具、继续追问或修正要求，也可以通过斜杠命令切换模型、恢复历史会话和调整审批策略。
 
-## Why this project exists
-
-The implementation keeps the important control flow visible: conversation history, context compaction, tool schemas, local dispatch, permission checks, retries, termination, and session recovery are ordinary Python modules that can be read and tested independently. The only model dependency is the official `openai` Python client used as transport for an OpenAI-compatible Chat Completions endpoint.
+项目不使用任何 Agent 框架，也不依赖服务端托管的文件工具或代码执行工具。兼容 OpenAI 接口的 Python 客户端只负责发送 Chat Completions 请求；对话历史、上下文压缩、工具定义、本地调度、权限检查、错误重试、终止条件以及会话恢复均由本项目自行实现。
 
 ```mermaid
 flowchart LR
-    U[User task] --> A[Agent engine]
-    A --> C[Context manager]
-    C --> M[Chat Completions model]
-    M -->|native tool_calls| A
-    A --> V[Validate call and permission]
-    V --> T[Local tool]
-    T -->|tool result with call ID| A
-    A -->|final text or bounded stop| U
-    A --> S[JSONL session log]
+    U[用户连续输入] --> A[Agent 引擎]
+    A --> C[上下文管理器]
+    C --> M[Chat Completions 模型]
+    M -->|原生 tool_calls| A
+    A --> V[参数与权限验证]
+    V --> T[本地工具]
+    T -->|携带调用 ID 的结果| A
+    A -->|最终回复| U
+    A --> S[JSONL 会话日志]
 ```
 
-## Requirements and installation
+## 环境要求与安装
 
-- Python 3.11 or newer
-- macOS or Linux
-- An OpenAI-compatible model that supports native function calling
+- Python 3.11 或更高版本
+- macOS 或 Linux
+- 一个兼容 OpenAI 接口且支持原生函数调用的模型
 
 ```bash
 python3 -m venv .venv
@@ -31,98 +29,147 @@ source .venv/bin/activate
 python -m pip install '.[dev]'
 ```
 
-Create a fresh API key. Never paste a real key into source code, documentation, screenshots, videos, or committed configuration. Export it only in the local shell:
+真实 API 密钥只能通过本地环境变量提供，不能出现在源码、文档、截图、视频或 Git 历史中：
 
 ```bash
-export LLM_API_KEY='newly-issued-key'
+export LLM_API_KEY='重新签发的密钥'
 export LLM_BASE_URL='https://token.bayesdl.com/api/maas/v1'
-export LLM_MODEL='model-id-from-doctor'
+export LLM_MODEL='模型编号'
 ```
 
-First list available models. After setting `LLM_MODEL`, the default doctor run also spends one small request to verify that the selected model returns a native function call:
+首次使用前运行诊断命令。设置 `LLM_MODEL` 后，完整诊断会额外发送一次很小的请求，以验证模型是否能返回原生函数调用：
 
 ```bash
 localloop doctor --skip-tool-check
 localloop doctor
 ```
 
-Run a task in a target workspace:
+## 交互式使用
+
+进入需要处理的项目目录，直接运行：
 
 ```bash
-localloop run 'Find the failing test, fix the bug without changing the public API, and run the tests.' --workspace /path/to/project
+localloop
 ```
 
-Read-only operations run immediately. File writes show a unified diff and commands show their argv before requesting approval. A disposable demonstration workspace can opt into autonomous execution explicitly:
+也可以指定工作区，或使用显式的 `chat` 别名：
 
 ```bash
-localloop run 'Fix the failing tests.' --workspace /tmp/demo --auto-approve
+localloop -C /path/to/project
+localloop chat --workspace /path/to/project
 ```
 
-If a run is interrupted, LocalLoop prints its session ID. Resume it without repeating the task:
+启动界面会显示当前模型、工作区和审批模式。直接输入编程任务即可；模型完成一轮后程序不会退出，可以继续追问，例如要求补充测试、解释设计或重新检查结果。输入历史保存在被 Git 忽略的 `.localloop/input_history` 中。
+
+### 交互命令
+
+| 命令 | 作用 |
+| --- | --- |
+| `/help` | 显示交互命令帮助 |
+| `/status` | 显示模型、工作区、审批模式和当前会话 |
+| `/new` | 清空当前上下文，下一条输入创建新会话 |
+| `/resume ID` | 恢复指定会话并继续对话 |
+| `/sessions` | 列出当前工作区最近十个会话 |
+| `/models` | 从兼容网关查询可用模型 |
+| `/model ID` | 为当前交互进程切换模型 |
+| `/approval ask` | 写文件和运行命令前逐次确认 |
+| `/approval auto` | 自动批准写入和命令，仅限可信工作区 |
+| `/clear` | 清屏并重新显示启动信息 |
+| `/exit` | 退出程序；也可按 Ctrl-D |
+
+程序会把同一交互进程中的后续普通输入追加到当前消息历史，因此模型能够看到上一轮的回复与工具结果。输入 `/new` 后才会开始一段全新的上下文。
+
+## 非交互式使用
+
+脚本、自动化测试或两分钟演示也可以继续使用单任务模式：
 
 ```bash
-localloop run --workspace /path/to/project --resume 12-character-id
+localloop run '找到失败的测试，在不修改公共 API 的前提下修复问题并运行测试。' \
+  --workspace /path/to/project
 ```
 
-## Locally implemented tools
+中断后可以使用输出中的会话编号恢复：
 
-| Tool | Purpose | Main guardrails |
+```bash
+localloop run --workspace /path/to/project --resume 12位会话编号
+```
+
+## 审批与安全边界
+
+只读工具会直接执行。写文件前默认展示统一 diff，命令执行前展示完整 argv，并请求用户批准。在可信、可丢弃的演示工作区中，可以显式使用 `--auto-approve`，或在交互模式输入 `/approval auto`：
+
+```bash
+localloop --workspace /tmp/demo --auto-approve
+```
+
+自动批准不是操作系统沙箱。即使程序会限制路径、敏感文件、破坏性命令、子进程环境和运行时间，也不应在不可信仓库或包含不可恢复数据的机器上使用该模式。
+
+## 本地实现的五个工具
+
+| 工具 | 用途 | 主要保护机制 |
 | --- | --- | --- |
-| `list_files` | Inspect a bounded directory tree | Omits internal and sensitive paths |
-| `read_file` | Read up to 400 UTF-8 lines | Size/binary checks; returns SHA-256 |
-| `search_text` | Literal code search | `rg` with a pure-Python fallback |
-| `write_file` | Create or atomically replace text | Approval, diff, workspace boundary, stale-write hash |
-| `run_command` | Execute tests and developer commands | Argv only, no shell, approval, sanitized environment, timeout |
+| `list_files` | 查看受限范围内的目录树 | 忽略内部路径和敏感路径 |
+| `read_file` | 读取最多 400 行 UTF-8 文本 | 大小与二进制检查；返回 SHA-256 |
+| `search_text` | 搜索字面代码内容 | 优先使用 `rg`，并提供纯 Python 备用实现 |
+| `write_file` | 创建或原子替换文本文件 | diff、用户批准、路径边界、陈旧写入哈希检查 |
+| `run_command` | 执行测试和开发命令 | argv、无 Shell、用户批准、环境净化、超时限制 |
 
-`run_command` intentionally blocks a small set of destructive commands and state-changing Git operations. It passes only a narrow set of non-secret environment variables to children. These controls reduce accidents; they are not an operating-system sandbox. Do not use `--auto-approve` on an untrusted repository or a machine containing irreplaceable data.
+`run_command` 会阻止一组明显破坏性的命令和会改写历史的 Git 操作，并且只向子进程传递少量不含密钥的环境变量。
 
-## Reliability design
+## 可靠性设计
 
-- Assistant tool calls are preserved exactly, and each result is returned as a `tool` message with the matching call ID.
-- Malformed arguments, unknown tools, command failures, and stale writes become structured results so the model can correct itself.
-- Timeouts, rate limits, and server failures retry at most three times with exponential backoff; authentication and invalid requests fail immediately.
-- A run stops on final text, the configured step/time limit, an empty response, user interruption, or three identical consecutive tool-call batches.
-- Full events remain in `.localloop/sessions/*.jsonl`. Old request context is compacted deterministically by replacing complete tool-interaction groups, so no second model is needed to invent a summary.
-- API keys are excluded from object representations, session data, tool prompts, and child-process environments.
+- Assistant 发起的工具调用会被完整保留，每个执行结果都会作为 `tool` 消息返回，并携带与原调用匹配的 call ID。
+- 参数错误、未知工具、命令失败和陈旧写入都会转换为结构化结果，使模型能够自行修正。
+- 超时、限流或服务器错误最多进行三次指数退避重试；认证失败和无效请求立即终止。
+- 每轮运行会在模型返回最终文本、达到步骤或时间限制、收到空响应、用户中断，或连续三次出现相同工具调用批次时停止。
+- 完整事件保存在 `.localloop/sessions/*.jsonl`；旧上下文以完整工具交互组为单位进行确定性压缩，不需要第二次模型总结。
+- API 密钥不会进入对象表示、会话记录、工具提示词或子进程环境。
 
-## Tests
+## 测试
 
-The default suite is deterministic and uses a scripted fake provider, so it needs no API key:
+默认测试套件使用脚本化 FakeProvider，不需要 API 密钥：
 
 ```bash
 ruff check .
 pytest --cov=localloop --cov-report=term-missing --cov-fail-under=85
 ```
 
-CI runs the same checks on Python 3.11 and 3.12. A live API request is deliberately not part of CI.
+CI 会在 Python 3.11 和 3.12 上运行相同检查；真实 API 请求不会进入 CI。
 
-## Two-minute demonstration
+## 两分钟演示
 
-The intentionally failing project under `demo/price_project` exercises reading, a guarded write, and test execution. Copy it so the checked-in fixture remains unchanged:
+`demo/price_project` 是一个故意包含金额精度和阈值边界问题的小项目。先复制到临时目录，保证仓库中的演示夹具不被修改：
 
 ```bash
 rm -rf /tmp/localloop-price-demo
 cp -R demo/price_project /tmp/localloop-price-demo
-cd /tmp/localloop-price-demo && pytest -q
-cd -
-localloop run 'Keep the public API unchanged. Find and fix the money precision and discount-threshold boundary bugs, add boundary tests, and run all tests.' --workspace /tmp/localloop-price-demo --auto-approve
+cd /tmp/localloop-price-demo
+pytest -q
+localloop --auto-approve
 ```
 
-The expected starting failures are part of the demo fixture and are excluded from this repository's normal test discovery. See `docs/VIDEO_SCRIPT.md`, `docs/ENGLISH_INTRO.md`, and `docs/DEFENSE.md` for presentation preparation.
+进入交互界面后输入：
 
-## Known limitations
+```text
+保持公共 API 不变。找出并修复金额精度问题和折扣阈值的边界 Bug，补充边界测试，并运行全部测试。
+```
 
-LocalLoop supports text files only, does not stream model output, has no OS-level sandbox, and expects a reasonably OpenAI-compatible Chat Completions implementation. Its character budget is a conservative, provider-independent approximation rather than an exact tokenizer count.
+任务完成后可继续输入“请解释你为什么这样修复，以及有哪些安全边界”，用第二轮对话展示上下文保持能力。详细录制流程见 `docs/视频脚本.md`。
 
-## Implementation map
+## 已知限制
 
-- `agent.py`: bounded model/tool loop and termination
-- `provider.py`: compatible transport, response parsing, retries, model probing
-- `tools.py`: schemas, validation, local execution, and output limits
-- `context.py`: deterministic context compaction
-- `session.py`: versioned append-only JSONL history and resume
-- `cli.py`: `doctor` and `run` user interface
+LocalLoop 目前仅处理 UTF-8 文本，不支持模型输出流式传输，也没有操作系统级沙箱。字符预算是一种与具体 Provider 无关的保守近似，不是精确的 tokenizer 统计。交互界面保持模型会话，但每条用户任务仍通过一个有明确步数和时间上限的 Agent 轮次完成。
 
-## License
+## 实现结构
 
-MIT
+- `agent.py`：有界模型/工具循环与终止逻辑
+- `interactive.py`：持续会话、终端界面与斜杠命令
+- `cli.py`：默认交互入口、`doctor` 和兼容的 `run` 模式
+- `provider.py`：接口传输、响应解析、重试和模型探测
+- `tools.py`：工具 Schema、参数验证、本地执行与输出限制
+- `context.py`：确定性上下文压缩
+- `session.py`：带版本号、仅追加的 JSONL 会话记录
+
+## 许可证
+
+项目采用 MIT 许可证。`LICENSE` 保留具有法律效力的标准英文原文，中文参考译文见 `LICENSE.zh-CN.md`。
