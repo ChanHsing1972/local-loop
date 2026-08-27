@@ -54,7 +54,7 @@ def _compact_group(group: list[Message]) -> Message:
 
 
 class ContextManager:
-    """Deterministic compaction without a second model call or summary hallucination."""
+    """不调用第二个模型、不会产生摘要幻觉的确定性上下文压缩器。"""
 
     def __init__(self, max_chars: int = 60_000, recent_groups: int = 6) -> None:
         if max_chars < 1_000:

@@ -22,7 +22,7 @@ from localloop.types import AssistantTurn, JsonObject, Message, ToolCall
 
 
 class ProviderError(RuntimeError):
-    """A sanitized, user-facing provider failure."""
+    """经过脱敏、可直接展示给用户的模型接口错误。"""
 
 
 def _safe_error(error: BaseException, api_key: str) -> str:
@@ -31,7 +31,7 @@ def _safe_error(error: BaseException, api_key: str) -> str:
 
 
 class OpenAIChatProvider:
-    """Thin transport adapter; orchestration deliberately lives in AgentEngine."""
+    """仅负责接口传输；所有编排逻辑均由 AgentEngine 自行实现。"""
 
     def __init__(
         self,
@@ -127,7 +127,7 @@ class OpenAIChatProvider:
 
 
 def probe_models(*, api_key: str, base_url: str, timeout: float = 15.0) -> list[str]:
-    """Probe an OpenAI-compatible models endpoint, including wrapped business errors."""
+    """探测兼容 OpenAI 的模型列表接口，并识别被包装的业务错误。"""
 
     request = urllib.request.Request(
         f"{base_url.rstrip('/')}/models",

@@ -124,7 +124,7 @@ def test_max_steps_empty_response_provider_error_and_timeout(tmp_path):
         empty_messages, empty_store
     )
     assert empty.status is RunStatus.ERROR
-    assert "neither text" in empty.final_output
+    assert "既未返回文本" in empty.final_output
 
     length_store, length_messages = create_new_session(
         workspace=tmp_path, task="length", model="fake"
@@ -133,7 +133,7 @@ def test_max_steps_empty_response_provider_error_and_timeout(tmp_path):
         tmp_path, FakeProvider([AssistantTurn("partial", finish_reason="length")])
     ).run(length_messages, length_store)
     assert length.status is RunStatus.ERROR
-    assert "truncated" in length.final_output
+    assert "被截断" in length.final_output
 
     error_store, error_messages = create_new_session(
         workspace=tmp_path, task="error", model="fake"
@@ -167,3 +167,21 @@ def test_create_and_resume_reject_invalid_history(tmp_path):
         raise AssertionError("expected ValueError")
     except ValueError:
         pass
+
+
+def test_interrupt_during_tool_fills_all_pending_results(tmp_path):
+    first = make_call("list_files", {"path": "."}, "first")
+    second = make_call("read_file", {"path": "missing"}, "second")
+    provider = FakeProvider([AssistantTurn("", (first, second))])
+    store, messages = create_new_session(workspace=tmp_path, task="interrupt", model="fake")
+    agent = engine(tmp_path, provider)
+
+    def interrupt(_call):
+        raise KeyboardInterrupt
+
+    agent.tools.execute = interrupt
+    result = agent.run(messages, store)
+    assert result.status is RunStatus.INTERRUPTED
+    tool_messages = [message for message in messages if message["role"] == "tool"]
+    assert [message["tool_call_id"] for message in tool_messages] == ["first", "second"]
+    assert all("用户中断" in message["content"] for message in tool_messages)

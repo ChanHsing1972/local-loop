@@ -22,21 +22,21 @@ def load_config(
 ) -> AgentConfig:
     root = Path(workspace).expanduser().resolve()
     if not root.exists() or not root.is_dir():
-        raise ConfigError(f"Workspace is not a directory: {root}")
+        raise ConfigError(f"工作区不是有效目录：{root}")
     if not 1 <= max_steps <= 100:
-        raise ConfigError("max_steps must be between 1 and 100")
+        raise ConfigError("max_steps 必须介于 1 和 100 之间")
     if not 1 <= max_duration_seconds <= 86_400:
-        raise ConfigError("max_duration_seconds must be between 1 and 86400")
+        raise ConfigError("max_duration_seconds 必须介于 1 和 86400 之间")
 
     api_key = os.environ.get("LLM_API_KEY", "").strip()
     base_url = os.environ.get("LLM_BASE_URL", DEFAULT_BASE_URL).strip().rstrip("/")
     model = os.environ.get("LLM_MODEL", "").strip()
     if not api_key:
-        raise ConfigError("LLM_API_KEY is not set")
+        raise ConfigError("尚未设置 LLM_API_KEY")
     if not base_url.startswith(("https://", "http://")):
-        raise ConfigError("LLM_BASE_URL must start with https:// or http://")
+        raise ConfigError("LLM_BASE_URL 必须以 https:// 或 http:// 开头")
     if require_model and not model:
-        raise ConfigError("LLM_MODEL is not set; run `localloop doctor` to list models")
+        raise ConfigError("尚未设置 LLM_MODEL；请运行 `localloop doctor` 查看可用模型")
 
     return AgentConfig(
         api_key=api_key,

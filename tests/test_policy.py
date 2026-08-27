@@ -12,11 +12,11 @@ def test_interactive_policy_yes_no_auto_and_eof():
     assert no.approve("write", "a.py") is False
     auto = InteractiveApprovalPolicy(auto_approve=True, output_fn=output.append)
     assert auto.approve("command", "pytest") is True
-    assert "[auto-approved]" in output
+    assert "[已自动批准]" in output
 
     def eof(_prompt):
         raise EOFError
 
     denied = InteractiveApprovalPolicy(input_fn=eof, output_fn=output.append)
     assert denied.approve("command", "pytest") is False
-    assert "Denied." in output
+    assert "已拒绝。" in output

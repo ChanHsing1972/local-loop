@@ -38,10 +38,9 @@ def test_invalid_environment(tmp_path, monkeypatch, updates, message):
 def test_invalid_workspace_and_limits(tmp_path, monkeypatch):
     monkeypatch.setenv("LLM_API_KEY", "key")
     monkeypatch.setenv("LLM_MODEL", "model")
-    with pytest.raises(ConfigError, match="Workspace"):
+    with pytest.raises(ConfigError, match="工作区"):
         load_config(tmp_path / "missing")
     with pytest.raises(ConfigError, match="max_steps"):
         load_config(tmp_path, max_steps=0)
     with pytest.raises(ConfigError, match="max_duration"):
         load_config(tmp_path, max_duration_seconds=0)
-

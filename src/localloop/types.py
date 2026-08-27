@@ -11,7 +11,7 @@ Message = dict[str, Any]
 
 @dataclass(frozen=True, slots=True)
 class AgentConfig:
-    """Runtime configuration with secrets deliberately excluded from repr."""
+    """运行配置；对象表示会主动排除密钥。"""
 
     api_key: str = field(repr=False)
     base_url: str
@@ -105,4 +105,3 @@ class ChatProvider(Protocol):
 
 class ApprovalPolicy(Protocol):
     def approve(self, action: str, details: str, preview: str = "") -> bool: ...
-

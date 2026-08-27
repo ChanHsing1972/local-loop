@@ -4,14 +4,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "localloop-agent"
-version = "0.1.0"
-description = "A small, auditable coding agent with locally executed tools."
+version = "0.2.0"
+description = "一个具有交互式终端与本地工具执行能力的可审计编程智能体。"
 readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}
 authors = [{name = "Candidate"}]
 dependencies = [
   "openai>=1.40,<3",
+  "prompt-toolkit>=3.0,<4",
+  "rich>=13.7,<15",
 ]
 
 [project.optional-dependencies]
@@ -45,4 +47,3 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
-

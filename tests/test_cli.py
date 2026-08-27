@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from localloop.agent import create_new_session
-from localloop.cli import main
+from localloop.cli import _parser, main
 from localloop.provider import ProviderError
 from localloop.types import AssistantTurn, RunResult, RunStatus, ToolCall
 
@@ -13,15 +13,15 @@ def test_doctor_without_key_is_actionable(monkeypatch, capsys):
     monkeypatch.delenv("LLM_MODEL", raising=False)
     assert main(["doctor"]) == 2
     captured = capsys.readouterr()
-    assert "API key: missing" in captured.out
-    assert "newly issued key" in captured.err
+    assert "API 密钥：未设置" in captured.out
+    assert "新签发" in captured.err
 
 
 def test_run_requires_exactly_task_or_resume(capsys):
     assert main(["run"]) == 2
-    assert "TASK is required" in capsys.readouterr().err
+    assert "必须提供 TASK" in capsys.readouterr().err
     assert main(["run", "task", "--resume", "abcdef123456"]) == 2
-    assert "omit TASK" in capsys.readouterr().err
+    assert "不要再提供 TASK" in capsys.readouterr().err
 
 
 def test_run_reports_missing_configuration(tmp_path, monkeypatch, capsys):
@@ -42,7 +42,7 @@ def test_doctor_lists_models_and_can_skip_paid_check(monkeypatch, capsys):
     assert main(["doctor", "--skip-tool-check"]) == 0
     output = capsys.readouterr().out
     assert "model-a *" in output
-    assert "tool calling check: skipped" in output
+    assert "原生工具调用检查：已跳过" in output
 
 
 def test_doctor_native_tool_check_success_and_failure(monkeypatch, capsys):
@@ -60,7 +60,7 @@ def test_doctor_native_tool_check_success_and_failure(monkeypatch, capsys):
 
     monkeypatch.setattr("localloop.cli.OpenAIChatProvider", DoctorProvider)
     assert main(["doctor"]) == 0
-    assert "tool calling check: passed" in capsys.readouterr().out
+    assert "原生工具调用检查：通过" in capsys.readouterr().out
 
     class WrongProvider(DoctorProvider):
         def complete(self, *_args, **_kwargs):
@@ -68,7 +68,7 @@ def test_doctor_native_tool_check_success_and_failure(monkeypatch, capsys):
 
     monkeypatch.setattr("localloop.cli.OpenAIChatProvider", WrongProvider)
     assert main(["doctor"]) == 2
-    assert "did not return" in capsys.readouterr().err
+    assert "没有返回" in capsys.readouterr().err
 
 
 def test_doctor_probe_and_tool_errors_are_actionable(monkeypatch, capsys):
@@ -114,8 +114,8 @@ def test_run_constructs_engine_and_maps_status(tmp_path, monkeypatch, capsys, st
     )
     assert code == (0 if status is RunStatus.COMPLETED else 1)
     captured = capsys.readouterr()
-    assert "session:" in captured.out
-    assert "auto-approve" in captured.out
+    assert "会话：" in captured.out
+    assert "自动批准" in captured.out
     if status is RunStatus.ERROR:
         assert "failed" in captured.err
 
@@ -136,3 +136,35 @@ def test_run_can_resume_existing_session(tmp_path, monkeypatch):
     assert (
         main(["run", "--workspace", str(tmp_path), "--resume", store.session_id]) == 0
     )
+
+
+def test_default_and_chat_commands_launch_interactive_shell(tmp_path, monkeypatch):
+    configured(monkeypatch)
+    calls = []
+
+    class FakeShell:
+        def __init__(self, config):
+            calls.append(config.workspace)
+
+        def run(self, *, initial_resume=None):
+            calls.append(initial_resume)
+            return 0
+
+    monkeypatch.setattr("localloop.cli.InteractiveShell", FakeShell)
+    assert main(["--workspace", str(tmp_path)]) == 0
+    assert main(["chat", "--workspace", str(tmp_path), "--resume", "abcdef123456"]) == 0
+    assert calls == [tmp_path.resolve(), None, tmp_path.resolve(), "abcdef123456"]
+
+
+def test_default_interactive_reports_missing_configuration(tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    assert main(["--workspace", str(tmp_path)]) == 2
+    assert "配置错误" in capsys.readouterr().err
+
+
+def test_generated_help_is_chinese():
+    help_text = _parser().format_help()
+    assert "用法：" in help_text
+    assert "位置参数：" in help_text
+    assert "选项：" in help_text
+    assert "显示帮助并退出" in help_text

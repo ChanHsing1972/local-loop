@@ -8,17 +8,17 @@ from localloop.context import ContextBudgetError, ContextManager
 from localloop.provider import ProviderError
 from localloop.session import SessionStore
 from localloop.tools import LocalTools
-from localloop.types import ChatProvider, Message, RunResult, RunStatus
+from localloop.types import ChatProvider, Message, RunResult, RunStatus, ToolResult
 
-SYSTEM_PROMPT = """You are LocalLoop, a coding agent operating inside one workspace.
-Use the provided local tools to inspect the project, make focused changes, and verify them.
-Rules:
-1. Never claim that a file changed or a command passed unless a tool result proves it.
-2. Read an existing file before updating it, then pass its latest SHA-256 to write_file.
-3. Prefer small, reviewable edits and run the most relevant tests after changes.
-4. Do not attempt to access paths outside the workspace or sensitive credentials.
-5. If a tool returns an error, diagnose it and either correct the call or explain the blocker.
-6. When the task is complete, respond with a concise summary and tests run, without a tool call.
+SYSTEM_PROMPT = """你是 LocalLoop，一个仅在指定工作区内工作的编程智能体。
+请使用提供的本地工具检查项目、完成聚焦的修改并验证结果。始终使用用户的语言回答。
+规则：
+1. 只有工具结果能够证明文件已修改或命令已通过，绝不能凭空宣称成功。
+2. 更新现有文件前必须先读取，并把最近读取所得的 SHA-256 传给 write_file。
+3. 优先进行小而可审查的修改，完成后运行最相关的测试。
+4. 不得尝试访问工作区之外的路径或敏感凭据。
+5. 工具返回错误时，应诊断原因并修正调用；无法解决时要明确说明阻碍。
+6. 任务完成后，不再调用工具，简洁总结修改内容与已运行的测试。
 """
 
 
@@ -51,10 +51,10 @@ class AgentEngine:
                 return self._finish(
                     session,
                     RunStatus.TIMED_OUT,
-                    "Agent stopped after reaching the total time limit.",
+                    "智能体已达到总时间限制并停止。",
                     step - 1,
                 )
-            self.output_fn(f"[step {step}/{self.max_steps}] asking model...")
+            self.output_fn(f"[步骤 {step}/{self.max_steps}] 正在请求模型…")
             try:
                 request_messages = self.context.prepare(messages)
                 turn = self.provider.complete(request_messages, self.tools.definitions)
@@ -64,7 +64,7 @@ class AgentEngine:
                 return self._finish(
                     session,
                     RunStatus.INTERRUPTED,
-                    "Interrupted; resume with --resume " + session.session_id,
+                    "运行已中断；可使用 --resume " + session.session_id + " 继续",
                     step - 1,
                 )
 
@@ -79,7 +79,7 @@ class AgentEngine:
                     return self._finish(
                         session,
                         RunStatus.ERROR,
-                        "Model output was truncated before the task could finish.",
+                        "模型输出在任务完成前被截断。",
                         step,
                     )
                 if turn.content.strip():
@@ -91,7 +91,7 @@ class AgentEngine:
                 return self._finish(
                     session,
                     RunStatus.ERROR,
-                    "Model returned neither text nor tool calls" + reason,
+                    "模型既未返回文本，也未返回工具调用" + reason,
                     step,
                 )
 
@@ -121,31 +121,47 @@ class AgentEngine:
                 return self._finish(
                     session,
                     RunStatus.REPEATED_CALL,
-                    "Agent stopped after repeating the same tool call three times.",
+                    "智能体连续三次重复相同工具调用，已停止运行。",
                     step,
                 )
 
-            for call in turn.tool_calls:
-                self.output_fn(f"[tool] {call.name}")
+            for call_index, call in enumerate(turn.tool_calls):
+                self.output_fn(f"[工具] {call.name}")
                 try:
                     result = self.tools.execute(call)
                 except KeyboardInterrupt:
+                    for pending_call in turn.tool_calls[call_index:]:
+                        interrupted_result = ToolResult(
+                            tool_call_id=pending_call.id,
+                            name=pending_call.name,
+                            ok=False,
+                            content=json.dumps(
+                                {
+                                    "ok": False,
+                                    "error": "用户中断了工具执行；当前或本批次剩余调用未正常完成",
+                                },
+                                ensure_ascii=False,
+                            ),
+                        )
+                        interrupted_message = interrupted_result.as_message()
+                        messages.append(interrupted_message)
+                        session.append_message(interrupted_message)
                     return self._finish(
                         session,
                         RunStatus.INTERRUPTED,
-                        "Interrupted; resume with --resume " + session.session_id,
+                        "运行已中断；可使用 --resume " + session.session_id + " 继续",
                         step,
                     )
                 result_message = result.as_message()
                 messages.append(result_message)
                 session.append_message(result_message)
-                status = "ok" if result.ok else "error"
-                self.output_fn(f"[tool {status}] {call.name}")
+                status = "成功" if result.ok else "失败"
+                self.output_fn(f"[工具{status}] {call.name}")
 
         return self._finish(
             session,
             RunStatus.MAX_STEPS,
-            f"Agent stopped after reaching the {self.max_steps}-step limit.",
+            f"智能体达到 {self.max_steps} 步限制，已停止运行。",
             self.max_steps,
         )
 
@@ -170,7 +186,7 @@ def create_new_session(
 ) -> tuple[SessionStore, list[Message]]:
     clean_task = task.strip()
     if not clean_task:
-        raise ValueError("Task must not be empty")
+        raise ValueError("任务不能为空")
     store = SessionStore.create(workspace, task=clean_task, model=model)
     messages: list[Message] = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -185,5 +201,5 @@ def resume_session(*, workspace, session_id: str) -> tuple[SessionStore, list[Me
     store = SessionStore.open(workspace, session_id)
     data = store.load()
     if len(data.messages) < 2:
-        raise ValueError("Session does not contain a valid prompt history")
+        raise ValueError("会话中没有有效的提示历史")
     return store, data.messages

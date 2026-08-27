@@ -16,22 +16,22 @@ class InteractiveApprovalPolicy:
         self.output_fn = output_fn
 
     def approve(self, action: str, details: str, preview: str = "") -> bool:
-        self.output_fn(f"\n[approval required] {action}: {details}")
+        self.output_fn(f"\n[需要批准] {action}：{details}")
         if preview:
             self.output_fn(preview)
         if self.auto_approve:
-            self.output_fn("[auto-approved]")
+            self.output_fn("[已自动批准]")
             return True
         try:
-            answer = self.input_fn("Approve? [y/N] ").strip().lower()
+            answer = self.input_fn("是否批准？[y/N] ").strip().lower()
         except (EOFError, KeyboardInterrupt):
-            self.output_fn("Denied.")
+            self.output_fn("已拒绝。")
             return False
-        return answer in {"y", "yes"}
+        return answer in {"y", "yes", "是"}
 
 
 class AlwaysApprovePolicy:
-    """Non-interactive policy used by deterministic tests."""
+    """供确定性测试使用的非交互式批准策略。"""
 
     def approve(self, action: str, details: str, preview: str = "") -> bool:
         return True
@@ -40,4 +40,3 @@ class AlwaysApprovePolicy:
 class AlwaysDenyPolicy:
     def approve(self, action: str, details: str, preview: str = "") -> bool:
         return False
-
