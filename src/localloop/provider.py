@@ -127,20 +127,31 @@ class OpenAIChatProvider:
         if message is None:
             raise ValueError("choice 中没有 message")
         calls: list[ToolCall] = []
+        call_ids: set[str] = set()
         for call in OpenAIChatProvider._field(message, "tool_calls", []) or []:
             call_type = OpenAIChatProvider._field(call, "type", "function")
             if call_type != "function":
                 raise ValueError(f"不支持的工具调用类型：{call_type}")
+            call_id = OpenAIChatProvider._field(call, "id")
+            if not isinstance(call_id, str) or not call_id.strip():
+                raise ValueError("工具调用缺少有效的调用编号")
+            if call_id in call_ids:
+                raise ValueError(f"工具调用编号重复：{call_id}")
+            call_ids.add(call_id)
             function = OpenAIChatProvider._field(call, "function")
             if function is None:
                 raise ValueError("工具调用中没有 function")
+            name = OpenAIChatProvider._field(function, "name")
+            arguments = OpenAIChatProvider._field(function, "arguments")
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError("工具调用缺少有效的函数名称")
+            if not isinstance(arguments, str):
+                raise ValueError(f"工具 {name} 的参数不是 JSON 字符串")
             calls.append(
                 ToolCall(
-                    id=str(OpenAIChatProvider._field(call, "id", "")),
-                    name=str(OpenAIChatProvider._field(function, "name", "")),
-                    arguments=str(
-                        OpenAIChatProvider._field(function, "arguments", "")
-                    ),
+                    id=call_id,
+                    name=name,
+                    arguments=arguments,
                 )
             )
         usage = None

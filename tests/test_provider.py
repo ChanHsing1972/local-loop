@@ -121,6 +121,49 @@ def test_rejects_business_error_inside_json_string():
         provider.complete([], [])
 
 
+@pytest.mark.parametrize(
+    ("tool_calls", "expected"),
+    [
+        (
+            [{"id": "", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}],
+            "调用编号",
+        ),
+        (
+            [
+                {"id": "same", "type": "function", "function": {"name": "a", "arguments": "{}"}},
+                {"id": "same", "type": "function", "function": {"name": "b", "arguments": "{}"}},
+            ],
+            "编号重复",
+        ),
+        (
+            [{"id": "id", "type": "function", "function": {"name": "", "arguments": "{}"}}],
+            "函数名称",
+        ),
+        (
+            [{"id": "id", "type": "function", "function": {"name": "read_file", "arguments": {}}}],
+            "不是 JSON 字符串",
+        ),
+    ],
+)
+def test_rejects_ambiguous_tool_call_shapes(tool_calls, expected):
+    response = {
+        "choices": [
+            {
+                "message": {"content": None, "tool_calls": tool_calls},
+                "finish_reason": "tool_calls",
+            }
+        ]
+    }
+    provider = OpenAIChatProvider(
+        api_key="secret",
+        base_url="https://example.test/v1",
+        model="model",
+        client=FakeClient([response]),
+    )
+    with pytest.raises(ProviderError, match=expected):
+        provider.complete([], [])
+
+
 def test_retries_empty_string_response_then_succeeds():
     sleeps = []
     client = FakeClient(["", "   ", '"重试后成功。"'])

@@ -220,3 +220,18 @@ def test_command_output_is_truncated(tmp_path):
     assert result["truncated"] is True
     assert "output truncated" in result["stdout"]
     assert "output truncated" in result["stderr"]
+
+
+def test_operating_system_error_becomes_structured_tool_result(tmp_path, monkeypatch):
+    target = tmp_path / "blocked.txt"
+    target.write_text("content", encoding="utf-8")
+
+    def denied(_path):
+        raise PermissionError(13, "permission denied", "/private/identity/blocked.txt")
+
+    monkeypatch.setattr("pathlib.Path.read_bytes", denied)
+    tools = LocalTools(tmp_path, AlwaysApprovePolicy())
+    result = tools.execute(make_call("read_file", {"path": "blocked.txt"}))
+    assert result.ok is False
+    assert "permission denied" in result.content
+    assert "/private/identity" not in result.content

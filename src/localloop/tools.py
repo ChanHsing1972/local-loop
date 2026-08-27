@@ -127,6 +127,9 @@ class LocalTools:
             ok = bool(payload.get("ok", True))
         except ToolError as exc:
             return self._error_result(call, str(exc))
+        except OSError as exc:
+            detail = exc.strerror or type(exc).__name__
+            return self._error_result(call, f"本地操作系统错误：{detail}")
         except TypeError as exc:
             return self._error_result(call, f"Invalid arguments for {call.name}: {exc}")
         return ToolResult(
