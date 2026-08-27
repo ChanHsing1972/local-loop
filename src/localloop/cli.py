@@ -128,14 +128,17 @@ def _doctor(skip_tool_check: bool) -> int:
             },
         },
     }
+    probe_messages = [
+        {
+            "role": "system",
+            "content": "请调用指定诊断函数；收到函数结果后，用一句文字确认诊断完成。",
+        },
+        {"role": "user", "content": "调用 doctor_echo，并把 value 设为 ok。"},
+    ]
     try:
         turn = provider.complete(
-            [
-                {"role": "system", "content": "请调用指定的诊断函数。"},
-                {"role": "user", "content": "调用 doctor_echo，并把 value 设为 ok。"},
-            ],
+            probe_messages,
             [test_tool],
-            tool_choice={"type": "function", "function": {"name": "doctor_echo"}},
         )
     except ProviderError as exc:
         print(f"错误：原生工具调用检查失败：{exc}", file=sys.stderr)
@@ -143,7 +146,27 @@ def _doctor(skip_tool_check: bool) -> int:
     if len(turn.tool_calls) != 1 or turn.tool_calls[0].name != "doctor_echo":
         print("错误：模型没有返回原生函数调用", file=sys.stderr)
         return 2
-    print("原生工具调用检查：通过")
+    call = turn.tool_calls[0]
+    probe_messages.extend(
+        [
+            turn.as_message(),
+            {
+                "role": "tool",
+                "tool_call_id": call.id,
+                "name": call.name,
+                "content": '{"ok":true,"value":"ok"}',
+            },
+        ]
+    )
+    try:
+        final_turn = provider.complete(probe_messages, [test_tool])
+    except ProviderError as exc:
+        print(f"错误：工具结果回填检查失败：{exc}", file=sys.stderr)
+        return 2
+    if final_turn.tool_calls or not final_turn.content.strip():
+        print("错误：模型收到工具结果后没有返回最终文本", file=sys.stderr)
+        return 2
+    print("原生工具调用与结果回填检查：通过")
     return 0
 
 

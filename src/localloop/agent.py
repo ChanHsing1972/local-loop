@@ -20,6 +20,7 @@ SYSTEM_PROMPT = """你是 LocalLoop，一个仅在指定工作区内工作的编
 5. 工具返回错误时，应诊断原因并修正调用；无法解决时要明确说明阻碍。
 6. 任务完成后，不再调用工具，简洁总结修改内容与已运行的测试。
 7. 当前工作区已由程序确定，不要再次询问路径；安全控制只能称为防误操作机制，不能称为完整沙箱。
+8. 寒暄、能力说明或不依赖项目事实的问题应直接回答，不要调用本地工具。
 """
 
 
@@ -119,6 +120,21 @@ class AgentEngine:
                 last_signature = signature
                 repeated = 1
             if repeated >= 3:
+                for call in turn.tool_calls:
+                    repeated_result = ToolResult(
+                        tool_call_id=call.id,
+                        name=call.name,
+                        ok=False,
+                        content=json.dumps(
+                            {
+                                "ok": False,
+                                "error": "相同工具调用已连续出现三次，本次未执行并终止循环",
+                            },
+                            ensure_ascii=False,
+                        ),
+                    ).as_message()
+                    messages.append(repeated_result)
+                    session.append_message(repeated_result)
                 return self._finish(
                     session,
                     RunStatus.REPEATED_CALL,
@@ -203,4 +219,46 @@ def resume_session(*, workspace, session_id: str) -> tuple[SessionStore, list[Me
     data = store.load()
     if len(data.messages) < 2:
         raise ValueError("会话中没有有效的提示历史")
-    return store, data.messages
+    messages = data.messages
+    _repair_trailing_tool_calls(store, messages)
+    return store, messages
+
+
+def _repair_trailing_tool_calls(store: SessionStore, messages: list[Message]) -> None:
+    """为进程意外退出后缺失的尾部工具结果追加明确错误。"""
+
+    assistant_index: int | None = None
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if message.get("role") == "assistant" and message.get("tool_calls"):
+            assistant_index = index
+            break
+        if message.get("role") != "tool":
+            return
+    if assistant_index is None:
+        return
+    trailing = messages[assistant_index + 1 :]
+    if any(message.get("role") != "tool" for message in trailing):
+        return
+    completed_ids = {str(message.get("tool_call_id", "")) for message in trailing}
+    calls = messages[assistant_index].get("tool_calls", [])
+    for call in calls:
+        call_id = str(call.get("id", ""))
+        if not call_id or call_id in completed_ids:
+            continue
+        function = call.get("function", {})
+        name = str(function.get("name", "unknown"))
+        result = ToolResult(
+            tool_call_id=call_id,
+            name=name,
+            ok=False,
+            content=json.dumps(
+                {
+                    "ok": False,
+                    "error": "上次进程在工具返回结果前退出；该调用的执行状态未知，请重新检查",
+                },
+                ensure_ascii=False,
+            ),
+        ).as_message()
+        messages.append(result)
+        store.append_message(result)

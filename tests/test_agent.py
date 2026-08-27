@@ -104,6 +104,9 @@ def test_three_identical_calls_stop_before_third_execution(tmp_path):
     result = engine(tmp_path, provider).run(messages, store)
     assert result.status is RunStatus.REPEATED_CALL
     assert result.steps == 3
+    tool_messages = [message for message in messages if message["role"] == "tool"]
+    assert len(tool_messages) == 3
+    assert "本次未执行" in tool_messages[-1]["content"]
 
 
 def test_max_steps_empty_response_provider_error_and_timeout(tmp_path):
@@ -185,3 +188,32 @@ def test_interrupt_during_tool_fills_all_pending_results(tmp_path):
     tool_messages = [message for message in messages if message["role"] == "tool"]
     assert [message["tool_call_id"] for message in tool_messages] == ["first", "second"]
     assert all("用户中断" in message["content"] for message in tool_messages)
+
+
+def test_resume_repairs_trailing_incomplete_tool_calls_once(tmp_path):
+    store, messages = create_new_session(workspace=tmp_path, task="crash", model="fake")
+    first = make_call("list_files", {"path": "."}, "first")
+    second = make_call("read_file", {"path": "a.py"}, "second")
+    assistant = AssistantTurn("", (first, second)).as_message()
+    first_result = {
+        "role": "tool",
+        "tool_call_id": "first",
+        "name": "list_files",
+        "content": '{"ok":true}',
+    }
+    store.append_message(assistant)
+    store.append_message(first_result)
+
+    resumed_store, resumed = resume_session(
+        workspace=tmp_path,
+        session_id=store.session_id,
+    )
+    assert resumed_store.session_id == store.session_id
+    assert [message.get("tool_call_id") for message in resumed[-2:]] == ["first", "second"]
+    assert "执行状态未知" in resumed[-1]["content"]
+
+    _store_again, resumed_again = resume_session(
+        workspace=tmp_path,
+        session_id=store.session_id,
+    )
+    assert [message.get("tool_call_id") for message in resumed_again].count("second") == 1

@@ -150,43 +150,68 @@ def test_empty_string_response_exhausts_retries_with_clear_error():
         provider.complete([], [])
 
 
-class FakeHTTPResponse:
+class FakeProbeResponse:
     def __init__(self, payload, status=200):
-        self.payload = json.dumps(payload).encode()
-        self.status = status
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *_args):
-        return False
-
-    def read(self, _limit):
-        return self.payload
+        self.content = json.dumps(payload).encode()
+        self.status_code = status
 
 
-def test_probe_models_standard_and_wrapped(monkeypatch):
-    monkeypatch.setattr(
-        "urllib.request.urlopen",
-        lambda *_args, **_kwargs: FakeHTTPResponse({"data": [{"id": "b"}, {"id": "a"}]}),
+class FakeProbeClient:
+    def __init__(self, items):
+        self.items = list(items)
+
+    def get(self, *_args, **_kwargs):
+        item = self.items.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+
+def test_probe_models_standard_and_wrapped():
+    assert probe_models(
+        api_key="key",
+        base_url="https://example.test/v1",
+        client=FakeProbeClient([FakeProbeResponse({"data": [{"id": "b"}, {"id": "a"}]})]),
+    ) == ["a", "b"]
+    assert probe_models(
+        api_key="key",
+        base_url="https://example.test/v1",
+        client=FakeProbeClient([FakeProbeResponse({"code": 200, "data": ["model"]})]),
+    ) == ["model"]
+
+
+def test_probe_models_retries_network_and_server_errors():
+    request = httpx.Request("GET", "https://example.test/v1/models")
+    sleeps = []
+    client = FakeProbeClient(
+        [
+            httpx.ConnectTimeout("timeout", request=request),
+            FakeProbeResponse({"error": "busy"}, status=503),
+            FakeProbeResponse({"data": ["model"]}),
+        ]
     )
-    assert probe_models(api_key="key", base_url="https://example.test/v1") == ["a", "b"]
-    monkeypatch.setattr(
-        "urllib.request.urlopen",
-        lambda *_args, **_kwargs: FakeHTTPResponse({"code": 200, "data": ["model"]}),
-    )
-    assert probe_models(api_key="key", base_url="https://example.test/v1") == ["model"]
+    assert probe_models(
+        api_key="key",
+        base_url="https://example.test/v1",
+        client=client,
+        max_retries=2,
+        sleeper=sleeps.append,
+    ) == ["model"]
+    assert sleeps == [1, 2]
 
 
-def test_probe_models_business_error_and_bad_json(monkeypatch):
-    monkeypatch.setattr(
-        "urllib.request.urlopen",
-        lambda *_args, **_kwargs: FakeHTTPResponse({"code": 401, "msg": "bad auth"}),
-    )
-    with pytest.raises(ProviderError, match="business error 401"):
-        probe_models(api_key="key", base_url="https://example.test/v1")
-    bad = FakeHTTPResponse({})
-    bad.payload = b"not json"
-    monkeypatch.setattr("urllib.request.urlopen", lambda *_args, **_kwargs: bad)
-    with pytest.raises(ProviderError, match="non-JSON"):
-        probe_models(api_key="key", base_url="https://example.test/v1")
+def test_probe_models_business_error_and_bad_json():
+    with pytest.raises(ProviderError, match="业务错误 401"):
+        probe_models(
+            api_key="key",
+            base_url="https://example.test/v1",
+            client=FakeProbeClient([FakeProbeResponse({"code": 401, "msg": "bad auth"})]),
+        )
+    bad = FakeProbeResponse({})
+    bad.content = b"not json"
+    with pytest.raises(ProviderError, match="非 JSON"):
+        probe_models(
+            api_key="key",
+            base_url="https://example.test/v1",
+            client=FakeProbeClient([bad]),
+        )

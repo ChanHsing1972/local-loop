@@ -33,6 +33,16 @@ def test_corrupt_session_is_rejected(tmp_path):
         store.load()
 
 
+def test_truncated_final_event_is_ignored_for_crash_recovery(tmp_path):
+    store = SessionStore.create(tmp_path, task="task", model="model")
+    store.append_message({"role": "system", "content": "rules"})
+    with store.path.open("a", encoding="utf-8") as stream:
+        stream.write('{"version":1,"kind":"message"')
+    loaded = store.load()
+    assert loaded.metadata["task"] == "task"
+    assert loaded.messages == [{"role": "system", "content": "rules"}]
+
+
 def test_unsupported_version_and_invalid_message_are_rejected(tmp_path):
     store = SessionStore.create(tmp_path, task="task", model="model")
     store.path.write_text(
@@ -58,4 +68,3 @@ def test_unsupported_version_and_invalid_message_are_rejected(tmp_path):
     )
     with pytest.raises(SessionError, match="Invalid message"):
         store.load()
-

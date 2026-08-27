@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import uuid
 from dataclasses import asdict, dataclass
@@ -66,6 +67,7 @@ class SessionStore:
         with self.path.open("a", encoding="utf-8") as stream:
             stream.write(line + "\n")
             stream.flush()
+            os.fsync(stream.fileno())
 
     def append_message(self, message: Message) -> None:
         self.append("message", {"message": message})
@@ -74,13 +76,16 @@ class SessionStore:
         metadata: JsonObject | None = None
         messages: list[Message] = []
         try:
-            lines = self.path.read_text(encoding="utf-8").splitlines()
+            raw_text = self.path.read_text(encoding="utf-8")
         except OSError as exc:
             raise SessionError(f"Cannot read session: {exc}") from exc
+        lines = raw_text.splitlines()
         for line_number, line in enumerate(lines, start=1):
             try:
                 raw: dict[str, Any] = json.loads(line)
             except json.JSONDecodeError as exc:
+                if line_number == len(lines) and not raw_text.endswith("\n"):
+                    break
                 raise SessionError(f"Invalid JSON at session line {line_number}") from exc
             if raw.get("version") != SESSION_VERSION:
                 raise SessionError(f"Unsupported session version at line {line_number}")

@@ -40,8 +40,9 @@ def test_compacts_whole_tool_groups_and_preserves_recent_call_ids():
     messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "task"}]
     messages += tool_group(1) + tool_group(2) + tool_group(3)
     prepared = ContextManager(max_chars=1_800, recent_groups=1).prepare(messages)
-    serialized = json.dumps(prepared)
-    assert "Compacted earlier tool interaction" in serialized
+    serialized = json.dumps(prepared, ensure_ascii=False)
+    assert "较早工具交互已压缩" in serialized
+    assert "read_file:未知" in serialized
     assert "call-3" in serialized
     assert "call-1" not in serialized
     assert message_chars(prepared) <= 1_800
@@ -53,7 +54,7 @@ def test_omits_old_summaries_until_budget_fits():
         messages += tool_group(index, 1_000)
     prepared = ContextManager(max_chars=2_200, recent_groups=2).prepare(messages)
     assert message_chars(prepared) <= 2_200
-    assert any("omitted" in str(message.get("content")) for message in prepared)
+    assert any("已省略" in str(message.get("content")) for message in prepared)
 
 
 def test_rejects_tiny_budget_and_oversized_pinned_prompt():
@@ -66,6 +67,15 @@ def test_rejects_tiny_budget_and_oversized_pinned_prompt():
         {"role": "user", "content": "u" * 900},
         {"role": "assistant", "content": "extra"},
     ]
-    with pytest.raises(ContextBudgetError, match="System prompt"):
+    with pytest.raises(ContextBudgetError, match="系统提示词"):
         ContextManager(max_chars=1_000).prepare(messages)
 
+
+def test_compacted_tool_result_records_status_length_and_preview():
+    messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "task"}]
+    messages += tool_group(1, 1_000) + tool_group(2, 1_000)
+    messages[3]["content"] = json.dumps({"ok": True, "content": "preview-value"})
+    prepared = ContextManager(max_chars=1_500, recent_groups=1).prepare(messages)
+    serialized = json.dumps(prepared, ensure_ascii=False)
+    assert "read_file:成功" in serialized
+    assert "preview-value" in serialized

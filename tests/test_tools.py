@@ -198,3 +198,25 @@ def test_denied_and_missing_command(tmp_path):
         make_call("run_command", {"args": ["definitely-not-a-command"]})
     )
     assert "not found" in missing.content
+
+
+def test_command_output_is_truncated(tmp_path):
+    tools = LocalTools(tmp_path, AlwaysApprovePolicy())
+    result = payload(
+        tools.execute(
+            make_call(
+                "run_command",
+                {
+                    "args": [
+                        "python3",
+                        "-c",
+                        "import sys; print('o' * 30000); print('e' * 30000, file=sys.stderr)",
+                    ]
+                },
+            )
+        )
+    )
+    assert result["ok"] is True
+    assert result["truncated"] is True
+    assert "output truncated" in result["stdout"]
+    assert "output truncated" in result["stderr"]

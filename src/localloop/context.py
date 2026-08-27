@@ -39,17 +39,26 @@ def _compact_group(group: list[Message]) -> Message:
         results = []
         for message in group[1:]:
             content = str(message.get("content", ""))
-            results.append(f"{message.get('name', 'tool')}:{len(content)} chars")
-        summary = ", ".join(results) or "no recorded result"
+            try:
+                payload = json.loads(content)
+            except (json.JSONDecodeError, TypeError):
+                payload = None
+            ok = payload.get("ok") if isinstance(payload, dict) else None
+            status = "成功" if ok is True else "失败" if ok is False else "未知"
+            preview = content[:120].replace("\n", " ")
+            results.append(
+                f"{message.get('name', 'tool')}:{status}:{len(content)}字符:预览={preview!r}"
+            )
+        summary = "；".join(results) or "没有记录工具结果"
         return {
             "role": "assistant",
-            "content": f"[Compacted earlier tool interaction: calls={names}; results={summary}]",
+            "content": f"[较早工具交互已压缩：调用={names}；结果={summary}]",
         }
     content = str(first.get("content", ""))
     preview = content[:240].replace("\n", " ")
     return {
         "role": first.get("role", "assistant"),
-        "content": f"[Compacted earlier message: {len(content)} chars; preview={preview!r}]",
+        "content": f"[较早消息已压缩：{len(content)} 字符；预览={preview!r}]",
     }
 
 
@@ -69,11 +78,11 @@ class ContextManager:
         if message_chars(copied) <= self.max_chars:
             return copied
         if len(copied) < 2:
-            raise ContextBudgetError("The pinned prompt exceeds the context budget")
+            raise ContextBudgetError("固定提示词超过上下文预算")
 
         pinned = copied[:2]
         if message_chars(pinned) > self.max_chars:
-            raise ContextBudgetError("System prompt and task exceed the context budget")
+            raise ContextBudgetError("系统提示词与原始任务超过上下文预算")
         groups = _group_messages(copied[2:])
         split = max(0, len(groups) - self.recent_groups)
         prepared_groups = [[_compact_group(group)] for group in groups[:split]] + groups[split:]
@@ -90,9 +99,7 @@ class ContextManager:
                     [
                         {
                             "role": "assistant",
-                            "content": (
-                                "[Older compacted interactions omitted to fit the context budget]"
-                            ),
+                            "content": "[为满足上下文预算，已省略更早的压缩交互]",
                         }
                     ],
                 )
@@ -100,6 +107,6 @@ class ContextManager:
         result = flatten()
         if message_chars(result) > self.max_chars:
             raise ContextBudgetError(
-                "Recent tool interactions exceed the context budget; start a new session"
+                "最近的工具交互超过上下文预算，请开始新会话"
             )
         return result

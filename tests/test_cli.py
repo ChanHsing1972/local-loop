@@ -51,16 +51,23 @@ def test_doctor_native_tool_check_success_and_failure(monkeypatch, capsys):
 
     class DoctorProvider:
         def __init__(self, **_kwargs):
-            pass
+            self.calls = 0
 
-        def complete(self, *_args, **_kwargs):
-            return AssistantTurn(
-                "", (ToolCall("id", "doctor_echo", '{"value":"ok"}'),)
-            )
+        def complete(self, messages, *_args, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return AssistantTurn(
+                    "", (ToolCall("id", "doctor_echo", '{"value":"ok"}'),)
+                )
+            assert messages[-2]["role"] == "assistant"
+            assert messages[-2]["tool_calls"][0]["id"] == "id"
+            assert messages[-1]["role"] == "tool"
+            assert messages[-1]["tool_call_id"] == "id"
+            return AssistantTurn("诊断完成。")
 
     monkeypatch.setattr("localloop.cli.OpenAIChatProvider", DoctorProvider)
     assert main(["doctor"]) == 0
-    assert "原生工具调用检查：通过" in capsys.readouterr().out
+    assert "原生工具调用与结果回填检查：通过" in capsys.readouterr().out
 
     class WrongProvider(DoctorProvider):
         def complete(self, *_args, **_kwargs):
@@ -69,6 +76,19 @@ def test_doctor_native_tool_check_success_and_failure(monkeypatch, capsys):
     monkeypatch.setattr("localloop.cli.OpenAIChatProvider", WrongProvider)
     assert main(["doctor"]) == 2
     assert "没有返回" in capsys.readouterr().err
+
+    class MissingFinalProvider(DoctorProvider):
+        def complete(self, *_args, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return AssistantTurn(
+                    "", (ToolCall("id", "doctor_echo", '{"value":"ok"}'),)
+                )
+            return AssistantTurn("")
+
+    monkeypatch.setattr("localloop.cli.OpenAIChatProvider", MissingFinalProvider)
+    assert main(["doctor"]) == 2
+    assert "没有返回最终文本" in capsys.readouterr().err
 
 
 def test_doctor_probe_and_tool_errors_are_actionable(monkeypatch, capsys):
