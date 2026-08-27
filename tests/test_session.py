@@ -1,0 +1,61 @@
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from localloop.session import SessionError, SessionStore
+
+
+def test_session_round_trip(tmp_path):
+    store = SessionStore.create(tmp_path, task="fix bug", model="test-model")
+    store.append_message({"role": "system", "content": "rules"})
+    store.append_message({"role": "user", "content": "fix bug"})
+    loaded = SessionStore.open(tmp_path, store.session_id).load()
+    assert loaded.metadata["task"] == "fix bug"
+    assert loaded.metadata["workspace_name"] == tmp_path.name
+    assert [message["role"] for message in loaded.messages] == ["system", "user"]
+    assert str(tmp_path.resolve()) not in store.path.read_text()
+
+
+def test_invalid_and_missing_session(tmp_path):
+    with pytest.raises(SessionError, match="Invalid"):
+        SessionStore(tmp_path, "../escape")
+    with pytest.raises(SessionError, match="not found"):
+        SessionStore.open(tmp_path, "abcdef123456")
+
+
+def test_corrupt_session_is_rejected(tmp_path):
+    store = SessionStore.create(tmp_path, task="task", model="model")
+    with store.path.open("a") as stream:
+        stream.write("not-json\n")
+    with pytest.raises(SessionError, match="Invalid JSON"):
+        store.load()
+
+
+def test_unsupported_version_and_invalid_message_are_rejected(tmp_path):
+    store = SessionStore.create(tmp_path, task="task", model="model")
+    store.path.write_text(
+        json.dumps({"version": 99, "kind": "metadata", "data": {}, "timestamp": "x"})
+        + "\n"
+    )
+    with pytest.raises(SessionError, match="Unsupported"):
+        store.load()
+    store.path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "kind": "metadata",
+                "data": {"task": "x"},
+                "timestamp": "x",
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {"version": 1, "kind": "message", "data": {"message": []}, "timestamp": "x"}
+        )
+        + "\n"
+    )
+    with pytest.raises(SessionError, match="Invalid message"):
+        store.load()
+
