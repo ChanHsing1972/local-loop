@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 
 from localloop import __version__
 from localloop.agent import AgentEngine, create_new_session, resume_session
-from localloop.config import DEFAULT_BASE_URL, ConfigError, load_config
+from localloop.config import DEFAULT_BASE_URL, ConfigError, load_config, load_environment
 from localloop.context import ContextManager
 from localloop.interactive import STATUS_LABELS, InteractiveShell
 from localloop.policy import InteractiveApprovalPolicy
@@ -84,14 +83,24 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _doctor(skip_tool_check: bool) -> int:
-    api_key = os.environ.get("LLM_API_KEY", "").strip()
-    base_url = os.environ.get("LLM_BASE_URL", DEFAULT_BASE_URL).strip().rstrip("/")
-    model = os.environ.get("LLM_MODEL", "").strip()
+    try:
+        environment = load_environment()
+    except ConfigError as exc:
+        print(f"配置错误：{exc}", file=sys.stderr)
+        return 2
+    api_key = environment.get("LLM_API_KEY", "").strip()
+    base_url = environment.get("LLM_BASE_URL", DEFAULT_BASE_URL).strip().rstrip("/")
+    model = environment.get("LLM_MODEL", "").strip()
     print(f"接口地址：{base_url}")
     print(f"API 密钥：{'已设置' if api_key else '未设置'}")
     print(f"当前模型：{model or '未设置'}")
     if not api_key:
-        print("错误：请设置新签发的 LLM_API_KEY，切勿将其提交到仓库", file=sys.stderr)
+        print("错误：请在 .env 设置新签发的 LLM_API_KEY，切勿将其提交到仓库", file=sys.stderr)
+        return 2
+    try:
+        load_config(".", require_model=False)
+    except ConfigError as exc:
+        print(f"配置错误：{exc}", file=sys.stderr)
         return 2
     try:
         models = probe_models(api_key=api_key, base_url=base_url)
@@ -242,6 +251,8 @@ def _run(args: argparse.Namespace) -> int:
         context=context,
         max_steps=config.max_steps,
         max_duration_seconds=config.max_duration_seconds,
+        stream_fn=lambda text: print(text, end="", flush=True),
+        stream_end_fn=lambda: print(),
     )
     result = engine.run(messages, session)
     print(

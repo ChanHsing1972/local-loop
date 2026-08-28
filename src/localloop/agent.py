@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 import time
 from collections.abc import Callable
 
@@ -34,6 +35,8 @@ class AgentEngine:
         max_steps: int,
         max_duration_seconds: int,
         output_fn: Callable[[str], None] = print,
+        stream_fn: Callable[[str], None] | None = None,
+        stream_end_fn: Callable[[], None] | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.provider = provider
@@ -42,6 +45,8 @@ class AgentEngine:
         self.max_steps = max_steps
         self.max_duration_seconds = max_duration_seconds
         self.output_fn = output_fn
+        self.stream_fn = stream_fn
+        self.stream_end_fn = stream_end_fn or (lambda: None)
         self.clock = clock
 
     def run(self, messages: list[Message], session: SessionStore) -> RunResult:
@@ -56,10 +61,26 @@ class AgentEngine:
                     "智能体已达到总时间限制并停止。",
                     step - 1,
                 )
-            self.output_fn(f"[步骤 {step}/{self.max_steps}] 正在请求模型…")
+            if step == 1:
+                activity = "正在分析任务、历史上下文和可用工具"
+            else:
+                activity = "正在根据上一项本地结果决定下一步"
+            self.output_fn(f"[模型] {activity}（第 {step} 次模型调用）…")
             try:
                 request_messages = self.context.prepare(messages)
-                turn = self.provider.complete(request_messages, self.tools.definitions)
+                stream_method = getattr(self.provider, "stream", None)
+                if self.stream_fn is not None and callable(stream_method):
+                    try:
+                        turn = stream_method(
+                            request_messages,
+                            self.tools.definitions,
+                            on_text_delta=self.stream_fn,
+                            on_retry=lambda detail: self.output_fn(f"[重试] {detail}"),
+                        )
+                    finally:
+                        self.stream_end_fn()
+                else:
+                    turn = self.provider.complete(request_messages, self.tools.definitions)
             except (ProviderError, ContextBudgetError) as exc:
                 return self._finish(session, RunStatus.ERROR, str(exc), step - 1)
             except KeyboardInterrupt:
@@ -85,7 +106,10 @@ class AgentEngine:
                         step,
                     )
                 if turn.content.strip():
-                    self.output_fn(turn.content)
+                    if self.stream_fn is None or not callable(
+                        getattr(self.provider, "stream", None)
+                    ):
+                        self.output_fn(turn.content)
                     return self._finish(
                         session, RunStatus.COMPLETED, turn.content.strip(), step
                     )
@@ -143,7 +167,7 @@ class AgentEngine:
                 )
 
             for call_index, call in enumerate(turn.tool_calls):
-                self.output_fn(f"[工具] {call.name}")
+                self.output_fn(f"[工具] {_describe_tool_call(call.name, call.arguments)}")
                 try:
                     result = self.tools.execute(call)
                 except KeyboardInterrupt:
@@ -173,7 +197,7 @@ class AgentEngine:
                 messages.append(result_message)
                 session.append_message(result_message)
                 status = "成功" if result.ok else "失败"
-                self.output_fn(f"[工具{status}] {call.name}")
+                self.output_fn(f"[工具{status}] {_describe_tool_result(call.name, result.content)}")
 
         return self._finish(
             session,
@@ -197,6 +221,65 @@ class AgentEngine:
             steps=steps,
         )
 
+
+def _describe_tool_call(name: str, raw_arguments: str) -> str:
+    try:
+        arguments = json.loads(raw_arguments)
+    except (json.JSONDecodeError, TypeError):
+        return f"{name} · 参数 JSON 无法解析"
+    if not isinstance(arguments, dict):
+        return f"{name} · 参数不是对象"
+    if name == "read_file":
+        start = arguments.get("start_line", 1)
+        end = arguments.get("end_line", start + 399 if isinstance(start, int) else "?")
+        return f"读取 {arguments.get('path', '?')} 第 {start}-{end} 行"
+    if name == "list_files":
+        return f"列出 {arguments.get('path', '.')}（深度 {arguments.get('max_depth', 3)}）"
+    if name == "search_text":
+        return f"在 {arguments.get('path', '.')} 搜索 {arguments.get('query', '')!r}"
+    if name == "write_file":
+        content = arguments.get("content", "")
+        size = len(content.encode("utf-8")) if isinstance(content, str) else "?"
+        return f"写入 {arguments.get('path', '?')}（{size} 字节）"
+    if name == "run_command":
+        args = arguments.get("args", [])
+        command = (
+            shlex.join(args)
+            if isinstance(args, list) and all(isinstance(x, str) for x in args)
+            else "?"
+        )
+        return f"在 {arguments.get('cwd', '.')} 运行 {command}"
+    return name
+
+
+def _describe_tool_result(name: str, raw_content: str) -> str:
+    try:
+        payload = json.loads(raw_content)
+    except (json.JSONDecodeError, TypeError):
+        return f"{name} · 返回内容无法解析"
+    if not isinstance(payload, dict):
+        return f"{name} · 返回内容不是对象"
+    if payload.get("ok") is False:
+        detail = str(payload.get("error", "未知错误")).replace("\n", " ")
+        return f"{name} · {detail[:300]}"
+    if name == "read_file":
+        return (
+            f"已读取 {payload.get('path', '?')} 第 {payload.get('start_line', '?')}-"
+            f"{payload.get('end_line', '?')} 行，共 {payload.get('total_lines', '?')} 行"
+        )
+    if name == "list_files":
+        return f"{payload.get('path', '.')} 中发现 {len(payload.get('entries', []))} 个条目"
+    if name == "search_text":
+        return f"找到 {len(payload.get('matches', []))} 条匹配"
+    if name == "write_file":
+        action = "已创建" if payload.get("created") else "已更新"
+        return f"{action} {payload.get('path', '?')}，写入 {payload.get('bytes_written', '?')} 字节"
+    if name == "run_command":
+        output = str(payload.get("stdout") or payload.get("stderr") or "").strip()
+        preview = " ".join(output.split())[:300]
+        suffix = f"；输出：{preview}" if preview else ""
+        return f"退出码 {payload.get('exit_code', '?')}{suffix}"
+    return name
 
 def create_new_session(
     *, workspace, task: str, model: str

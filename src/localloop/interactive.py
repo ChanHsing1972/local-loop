@@ -6,8 +6,11 @@ from dataclasses import replace
 from typing import Any
 
 from prompt_toolkit import PromptSession
-from prompt_toolkit.completion import WordCompleter
+from prompt_toolkit.completion import CompleteEvent, Completer, Completion
+from prompt_toolkit.document import Document
+from prompt_toolkit.formatted_text import AnyFormattedText
 from prompt_toolkit.history import FileHistory
+from prompt_toolkit.shortcuts import CompleteStyle
 from prompt_toolkit.styles import Style
 from rich.console import Console
 from rich.markdown import Markdown
@@ -24,19 +27,43 @@ from localloop.session import SessionError, SessionStore
 from localloop.tools import LocalTools
 from localloop.types import AgentConfig, ChatProvider, Message, RunStatus
 
-COMMANDS = (
-    "/help",
-    "/status",
-    "/new",
-    "/resume",
-    "/sessions",
-    "/models",
-    "/model",
-    "/approval",
-    "/clear",
-    "/exit",
-    "/quit",
+COMMAND_HELP = (
+    ("/help", "/help", "显示全部交互命令"),
+    ("/status", "/status", "显示模型、工作区、审批模式和当前会话"),
+    ("/new", "/new", "结束当前上下文，下一条输入创建新会话"),
+    ("/resume", "/resume ID", "恢复指定会话"),
+    ("/sessions", "/sessions", "列出最近会话"),
+    ("/models", "/models", "从网关获取可用模型"),
+    ("/model", "/model ID", "切换当前交互会话使用的模型"),
+    ("/approval", "/approval ask|auto", "切换逐次确认或自动批准"),
+    ("/clear", "/clear", "清屏并重新显示启动信息"),
+    ("/exit", "/exit", "退出 LocalLoop"),
+    ("/quit", "/quit", "退出 LocalLoop（/exit 的别名）"),
 )
+COMMANDS = tuple(command for command, _usage, _description in COMMAND_HELP)
+
+
+class SlashCommandCompleter(Completer):
+    """输入斜杠时展示所有命令及说明，并支持按前缀筛选。"""
+
+    def get_completions(
+        self,
+        document: Document,
+        complete_event: CompleteEvent,
+    ):
+        del complete_event
+        text = document.text_before_cursor
+        if not text.startswith("/") or any(character.isspace() for character in text):
+            return
+        for command, usage, description in COMMAND_HELP:
+            if command.startswith(text):
+                display: AnyFormattedText = [("class:completion.command", usage)]
+                yield Completion(
+                    command,
+                    start_position=-len(text),
+                    display=display,
+                    display_meta=description,
+                )
 
 STATUS_LABELS = {
     RunStatus.COMPLETED: "已完成",
@@ -74,6 +101,7 @@ class InteractiveShell:
         self.approval_input = approval_input
         self.session: SessionStore | None = None
         self.messages: list[Message] | None = None
+        self._stream_open = False
         history_dir = (config.workspace / ".localloop").resolve(strict=False)
         try:
             history_dir.relative_to(config.workspace)
@@ -88,12 +116,19 @@ class InteractiveShell:
         os.chmod(history_path, 0o600)
         self.prompt_session = prompt_session or PromptSession(
             history=FileHistory(str(history_path)),
-            completer=WordCompleter(COMMANDS, sentence=True),
-            complete_while_typing=False,
+            completer=SlashCommandCompleter(),
+            complete_while_typing=True,
+            complete_style=CompleteStyle.COLUMN,
+            reserve_space_for_menu=len(COMMANDS),
             style=Style.from_dict(
                 {
                     "prompt": "ansicyan bold",
                     "bottom-toolbar": "bg:#eeeeee #555555",
+                    "completion-menu.completion": "bg:#f4f4f4 #222222",
+                    "completion-menu.completion.current": "bg:#00a6b2 #ffffff bold",
+                    "completion-menu.meta.completion": "bg:#f4f4f4 #777777",
+                    "completion-menu.meta.completion.current": "bg:#00a6b2 #ffffff",
+                    "completion.command": "ansicyan bold",
                 }
             ),
         )
@@ -118,6 +153,8 @@ class InteractiveShell:
             max_steps=self.config.max_steps,
             max_duration_seconds=self.config.max_duration_seconds,
             output_fn=self._agent_output,
+            stream_fn=self._agent_stream,
+            stream_end_fn=self._agent_stream_end,
         )
 
     def run(self, *, initial_resume: str | None = None) -> int:
@@ -243,19 +280,8 @@ class InteractiveShell:
         table = Table(title="可用命令", show_header=False, box=None)
         table.add_column(style="cyan", no_wrap=True)
         table.add_column()
-        rows = (
-            ("/status", "显示模型、工作区、审批模式和当前会话"),
-            ("/new", "结束当前上下文，下一条输入创建新会话"),
-            ("/resume ID", "恢复指定会话"),
-            ("/sessions", "列出最近会话"),
-            ("/models", "从网关获取可用模型"),
-            ("/model ID", "切换当前交互会话使用的模型"),
-            ("/approval ask|auto", "切换逐次确认或自动批准"),
-            ("/clear", "清屏并重新显示启动信息"),
-            ("/exit", "退出 LocalLoop"),
-        )
-        for row in rows:
-            table.add_row(*row)
+        for _command, usage, description in COMMAND_HELP:
+            table.add_row(usage, description)
         self.console.print(table)
 
     def _show_status(self) -> None:
@@ -345,8 +371,10 @@ class InteractiveShell:
         return [("class:bottom-toolbar", text)]
 
     def _agent_output(self, text: str) -> None:
-        if text.startswith("[步骤"):
+        if text.startswith("[模型]"):
             self.console.print("● " + text, style="dim cyan")
+        elif text.startswith("[重试]"):
+            self.console.print("  ↻ " + text, style="yellow")
         elif text.startswith("[工具成功]"):
             self.console.print("  ✓ " + text, style="green")
         elif text.startswith("[工具失败]"):
@@ -356,6 +384,18 @@ class InteractiveShell:
         else:
             self.console.print()
             self.console.print(Markdown(text))
+
+    def _agent_stream(self, text: str) -> None:
+        if not self._stream_open:
+            self.console.print()
+            self.console.print("● ", style="cyan", end="")
+            self._stream_open = True
+        self.console.print(text, markup=False, end="", soft_wrap=True)
+
+    def _agent_stream_end(self) -> None:
+        if self._stream_open:
+            self.console.print()
+            self._stream_open = False
 
     def _approval_output(self, text: str) -> None:
         if text.startswith("[需要批准]") or text.startswith("\n[需要批准]"):

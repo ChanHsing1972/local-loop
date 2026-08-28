@@ -5,6 +5,32 @@ import pytest
 from localloop.config import ConfigError, load_config
 
 
+def test_loads_dotenv_without_export_and_environment_wins(tmp_path, monkeypatch):
+    (tmp_path / ".env").write_text(
+        "LLM_API_KEY='file-key'\n"
+        "LLM_BASE_URL=https://dotenv.test/v1/ # local gateway\n"
+        "LLM_MODEL=file-model\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    for name in ("LLM_API_KEY", "LLM_BASE_URL", "LLM_MODEL"):
+        monkeypatch.delenv(name, raising=False)
+    config = load_config(tmp_path)
+    assert config.api_key == "file-key"
+    assert config.base_url == "https://dotenv.test/v1"
+    assert config.model == "file-model"
+
+    monkeypatch.setenv("LLM_MODEL", "exported-model")
+    assert load_config(tmp_path).model == "exported-model"
+
+
+def test_rejects_malformed_dotenv(tmp_path, monkeypatch):
+    (tmp_path / ".env").write_text("NOT VALID\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(ConfigError, match="KEY=VALUE"):
+        load_config(tmp_path)
+
+
 def test_load_config_and_secret_is_not_in_repr(tmp_path, monkeypatch):
     monkeypatch.setenv("LLM_API_KEY", "super-secret")
     monkeypatch.setenv("LLM_BASE_URL", "https://example.test/v1/")

@@ -43,7 +43,7 @@ class OpenAIChatProvider:
         base_url: str,
         model: str,
         timeout: float = 60.0,
-        max_retries: int = 3,
+        max_retries: int = 2,
         sleeper: Callable[[float], None] = time.sleep,
         client: Any | None = None,
     ) -> None:
@@ -65,40 +65,97 @@ class OpenAIChatProvider:
         *,
         tool_choice: str | JsonObject = "auto",
     ) -> AssistantTurn:
+        return self._request(messages, tools, tool_choice=tool_choice)
+
+    def stream(
+        self,
+        messages: list[Message],
+        tools: list[JsonObject],
+        *,
+        tool_choice: str | JsonObject = "auto",
+        on_text_delta: Callable[[str], None],
+        on_retry: Callable[[str], None] | None = None,
+    ) -> AssistantTurn:
+        """流式返回正文，同时在本地拼装完整文本和原生工具调用。"""
+
+        return self._request(
+            messages,
+            tools,
+            tool_choice=tool_choice,
+            on_text_delta=on_text_delta,
+            on_retry=on_retry,
+        )
+
+    def _request(
+        self,
+        messages: list[Message],
+        tools: list[JsonObject],
+        *,
+        tool_choice: str | JsonObject,
+        on_text_delta: Callable[[str], None] | None = None,
+        on_retry: Callable[[str], None] | None = None,
+    ) -> AssistantTurn:
+        streaming = on_text_delta is not None
         for attempt in range(self.max_retries + 1):
+            stream_state = [False]
             try:
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,
-                    tools=tools,
-                    tool_choice=tool_choice,
-                )
+                request: dict[str, Any] = {
+                    "model": self.model,
+                    "messages": messages,
+                    "tools": tools,
+                    "tool_choice": tool_choice,
+                }
+                if streaming:
+                    request["stream"] = True
+                response = self.client.chat.completions.create(**request)
+                if streaming:
+                    turn, _received = self._parse_stream(
+                        response, on_text_delta, stream_state=stream_state
+                    )
+                    return turn
                 return self._parse_response(response)
             except (AuthenticationError, PermissionDeniedError, BadRequestError) as exc:
                 raise ProviderError(_safe_error(exc, self.api_key)) from exc
             except RateLimitError as exc:
+                if stream_state[0]:
+                    raise ProviderError(
+                        "模型输出流在传输中断开；已保留已显示内容，请重试本轮任务"
+                    ) from exc
                 if attempt >= self.max_retries:
                     raise ProviderError(_safe_error(exc, self.api_key)) from exc
             except APIStatusError as exc:
+                if stream_state[0]:
+                    raise ProviderError(
+                        "模型输出流在传输中断开；已保留已显示内容，请重试本轮任务"
+                    ) from exc
                 if exc.status_code not in {408, 409, 429} and exc.status_code < 500:
                     raise ProviderError(_safe_error(exc, self.api_key)) from exc
                 if attempt >= self.max_retries:
                     raise ProviderError(_safe_error(exc, self.api_key)) from exc
             except (APIConnectionError, APITimeoutError) as exc:
+                if stream_state[0]:
+                    raise ProviderError(
+                        "模型输出流在传输中断开；已保留已显示内容，请重试本轮任务"
+                    ) from exc
                 if attempt >= self.max_retries:
                     raise ProviderError(_safe_error(exc, self.api_key)) from exc
             except _RetryableResponseError as exc:
                 if attempt >= self.max_retries:
                     raise ProviderError(
                         f"网关连续 {attempt + 1} 次返回空响应；"
-                        "请稍后重试，或使用 /model 切换模型"
+                        "请运行 localloop doctor 检查网关，或使用 /model 切换模型"
                     ) from exc
             except (AttributeError, TypeError, ValueError) as exc:
                 raise ProviderError(
                     "网关返回了不兼容的 Chat Completions 响应："
                     + _safe_error(exc, self.api_key)
                 ) from exc
-            self.sleeper(min(2**attempt, 8))
+            delay = min(2**attempt, 8)
+            if on_retry:
+                on_retry(
+                    f"第 {attempt + 1} 次请求未得到可用响应，{delay} 秒后重试"
+                )
+            self.sleeper(delay)
         raise AssertionError("retry loop exhausted")  # pragma: no cover
 
     @staticmethod
@@ -121,11 +178,11 @@ class OpenAIChatProvider:
         else:
             choices = getattr(response, "choices", None)
         if not choices:
-            raise ValueError("响应中没有 choices")
+            raise _RetryableResponseError("响应中没有 choices")
         choice = choices[0]
         message = OpenAIChatProvider._field(choice, "message")
         if message is None:
-            raise ValueError("choice 中没有 message")
+            raise _RetryableResponseError("choice 中没有 message")
         calls: list[ToolCall] = []
         call_ids: set[str] = set()
         for call in OpenAIChatProvider._field(message, "tool_calls", []) or []:
@@ -164,12 +221,92 @@ class OpenAIChatProvider:
             )
         raw_content = OpenAIChatProvider._field(message, "content", "")
         content = raw_content if isinstance(raw_content, str) else ""
-        return AssistantTurn(
+        turn = AssistantTurn(
             content=content,
             tool_calls=tuple(calls),
             finish_reason=OpenAIChatProvider._field(choice, "finish_reason"),
             usage=usage,
         )
+        if not turn.content.strip() and not turn.tool_calls:
+            raise _RetryableResponseError("message 中没有文本或工具调用")
+        return turn
+
+    @staticmethod
+    def _parse_stream(
+        response: Any,
+        on_text_delta: Callable[[str], None],
+        *,
+        stream_state: list[bool] | None = None,
+    ) -> tuple[AssistantTurn, bool]:
+        content_parts: list[str] = []
+        calls: dict[int, dict[str, str]] = {}
+        finish_reason: str | None = None
+        usage: JsonObject | None = None
+        received = False
+        try:
+            for chunk in response:
+                if isinstance(chunk, Mapping):
+                    OpenAIChatProvider._raise_payload_error(chunk)
+                raw_usage = OpenAIChatProvider._field(chunk, "usage")
+                if raw_usage is not None:
+                    usage = (
+                        raw_usage.model_dump(exclude_none=True)
+                        if hasattr(raw_usage, "model_dump")
+                        else dict(raw_usage)
+                    )
+                choices = OpenAIChatProvider._field(chunk, "choices", []) or []
+                for choice in choices:
+                    received = True
+                    if stream_state is not None:
+                        stream_state[0] = True
+                    reason = OpenAIChatProvider._field(choice, "finish_reason")
+                    if reason:
+                        finish_reason = str(reason)
+                    delta = OpenAIChatProvider._field(choice, "delta")
+                    if delta is None:
+                        continue
+                    content = OpenAIChatProvider._field(delta, "content", "")
+                    if isinstance(content, str) and content:
+                        content_parts.append(content)
+                        on_text_delta(content)
+                    for fallback_index, call in enumerate(
+                        OpenAIChatProvider._field(delta, "tool_calls", []) or []
+                    ):
+                        index = OpenAIChatProvider._field(call, "index", fallback_index)
+                        if not isinstance(index, int):
+                            raise ValueError("流式工具调用缺少有效 index")
+                        aggregate = calls.setdefault(index, {"id": "", "name": "", "arguments": ""})
+                        call_id = OpenAIChatProvider._field(call, "id", "")
+                        if isinstance(call_id, str) and call_id:
+                            aggregate["id"] = call_id
+                        function = OpenAIChatProvider._field(call, "function")
+                        if function is not None:
+                            name = OpenAIChatProvider._field(function, "name", "")
+                            arguments = OpenAIChatProvider._field(function, "arguments", "")
+                            if isinstance(name, str) and name:
+                                aggregate["name"] += name
+                            if isinstance(arguments, str) and arguments:
+                                aggregate["arguments"] += arguments
+        finally:
+            close = getattr(response, "close", None)
+            if callable(close):
+                close()
+        tool_calls = tuple(
+            ToolCall(id=item["id"], name=item["name"], arguments=item["arguments"])
+            for _, item in sorted(calls.items())
+        )
+        for call in tool_calls:
+            if not call.id or not call.name:
+                raise ValueError("流式工具调用缺少编号或名称")
+        turn = AssistantTurn(
+            content="".join(content_parts),
+            tool_calls=tool_calls,
+            finish_reason=finish_reason,
+            usage=usage,
+        )
+        if not turn.content.strip() and not turn.tool_calls:
+            raise _RetryableResponseError("流中没有文本或工具调用")
+        return turn, received
 
     @staticmethod
     def _field(value: Any, name: str, default: Any = None) -> Any:

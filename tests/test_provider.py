@@ -41,6 +41,27 @@ class FakeClient:
         self.chat = SimpleNamespace(completions=self.completions)
 
 
+class FakeStream:
+    def __init__(self, items):
+        self.items = list(items)
+        self.closed = False
+
+    def __iter__(self):
+        for item in self.items:
+            if isinstance(item, BaseException):
+                raise item
+            yield item
+
+    def close(self):
+        self.closed = True
+
+
+def stream_chunk(*, content="", tool_calls=None, finish_reason=None, usage=None):
+    delta = SimpleNamespace(content=content, tool_calls=tool_calls or [])
+    choice = SimpleNamespace(delta=delta, finish_reason=finish_reason)
+    return SimpleNamespace(choices=[choice], usage=usage)
+
+
 def test_parses_tool_calls_usage_and_request_shape():
     client = FakeClient([response_with_tool()])
     provider = OpenAIChatProvider(
@@ -68,11 +89,11 @@ def test_retries_timeout_then_succeeds_without_leaking_key():
 
 
 def test_incompatible_response_is_sanitized():
-    client = FakeClient([SimpleNamespace(choices=[])])
+    client = FakeClient([SimpleNamespace(choices=[])] * 3)
     provider = OpenAIChatProvider(
         api_key="secret", base_url="https://example.test/v1", model="model", client=client
     )
-    with pytest.raises(ProviderError, match="不兼容") as error:
+    with pytest.raises(ProviderError, match="连续 3 次返回空响应") as error:
         provider.complete([], [])
     assert "secret" not in str(error.value)
 
@@ -191,6 +212,88 @@ def test_empty_string_response_exhausts_retries_with_clear_error():
     )
     with pytest.raises(ProviderError, match="连续 2 次返回空响应"):
         provider.complete([], [])
+
+
+def test_streams_text_and_assembles_fragmented_tool_call():
+    text_stream = FakeStream(
+        [
+            stream_chunk(content="你"),
+            stream_chunk(content="好", finish_reason="stop"),
+        ]
+    )
+    text_client = FakeClient([text_stream])
+    deltas = []
+    provider = OpenAIChatProvider(
+        api_key="secret", base_url="https://example.test/v1", model="model", client=text_client
+    )
+    turn = provider.stream([], [], on_text_delta=deltas.append)
+    assert turn.content == "你好"
+    assert deltas == ["你", "好"]
+    assert text_stream.closed is True
+    request = text_client.completions.calls[0]
+    assert request["stream"] is True
+    assert "stream_options" not in request
+
+    call_head = SimpleNamespace(
+        index=0,
+        id="call-1",
+        function=SimpleNamespace(name="read_file", arguments='{"path":'),
+    )
+    call_tail = SimpleNamespace(
+        index=0,
+        id=None,
+        function=SimpleNamespace(name=None, arguments='"agent.py"}'),
+    )
+    tool_provider = OpenAIChatProvider(
+        api_key="secret",
+        base_url="https://example.test/v1",
+        model="model",
+        client=FakeClient(
+            [
+                FakeStream(
+                    [
+                        stream_chunk(tool_calls=[call_head]),
+                        stream_chunk(tool_calls=[call_tail], finish_reason="tool_calls"),
+                    ]
+                )
+            ]
+        ),
+    )
+    tool_turn = tool_provider.stream([], [], on_text_delta=lambda _text: None)
+    assert tool_turn.tool_calls[0].name == "read_file"
+    assert json.loads(tool_turn.tool_calls[0].arguments) == {"path": "agent.py"}
+
+
+def test_empty_stream_retries_with_observable_status():
+    client = FakeClient([FakeStream([]), FakeStream([stream_chunk(content="ok")])])
+    sleeps = []
+    retries = []
+    provider = OpenAIChatProvider(
+        api_key="secret",
+        base_url="https://example.test/v1",
+        model="model",
+        client=client,
+        sleeper=sleeps.append,
+    )
+    turn = provider.stream(
+        [], [], on_text_delta=lambda _text: None, on_retry=retries.append
+    )
+    assert turn.content == "ok"
+    assert sleeps == [1]
+    assert retries == ["第 1 次请求未得到可用响应，1 秒后重试"]
+
+
+def test_partial_stream_failure_is_not_retried_or_duplicated():
+    timeout = APITimeoutError(request=httpx.Request("POST", "https://example.test"))
+    client = FakeClient([FakeStream([stream_chunk(content="partial"), timeout])])
+    deltas = []
+    provider = OpenAIChatProvider(
+        api_key="secret", base_url="https://example.test/v1", model="model", client=client
+    )
+    with pytest.raises(ProviderError, match="传输中断开"):
+        provider.stream([], [], on_text_delta=deltas.append)
+    assert deltas == ["partial"]
+    assert len(client.completions.calls) == 1
 
 
 class FakeProbeResponse:

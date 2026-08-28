@@ -1,7 +1,5 @@
 仓库地址：https://github.com/ChanHsing1972/local-loop
 
-运行环境：Python 3.11+，支持 macOS/Linux。执行 python3 -m venv .venv，激活后运行 python -m pip install .。在本机终端设置 LLM_API_KEY、LLM_BASE_URL、LLM_MODEL，真实凭据不得写入文件。先运行 localloop doctor 检查模型和原生工具调用；进入目标目录执行 localloop，即可在交互界面连续输入任务和追问。/help 显示命令，/new 新建上下文，/resume 恢复会话，/model 切换模型，/approval 调整审批。自动化场景仍可使用 localloop run "任务" --workspace 项目目录。
+运行：需要 Python 3.11+。执行 python3 -m venv .venv，激活后运行 python -m pip install .；复制 .env.example 为 .env，填写 LLM_API_KEY、LLM_BASE_URL、LLM_MODEL（.env 已忽略，严禁提交真实凭据）。先运行 localloop doctor 验证接口；在目标目录运行 localloop，即可连续输入任务和追问。输入 / 会在下方展示所有命令及说明，并支持选择补全；/new 新建上下文，/resume 恢复会话，/model 切换模型。
 
-特色功能：项目不使用任何 Agent 框架，独立实现交互式多轮会话、模型-工具循环、消息历史、确定性上下文压缩、JSONL 恢复、错误回填、重试和多重终止条件。五个本地工具支持目录浏览、分段读文件、代码搜索、原子写文件和无 Shell 命令执行；路径限制在工作区内，敏感文件被拦截，更新文件需匹配最近读取的 SHA-256，写入和命令默认需确认，子进程环境会移除密钥类变量。测试使用 FakeProvider，不消耗 API，覆盖正常流程、持续对话、异常恢复和安全边界。
-
-局限：当前仅处理 UTF-8 文本，安全策略用于降低误操作风险，并非操作系统级沙箱。
+特色：项目不使用 Agent 框架，独立实现流式模型输出、原生工具调用解析、本地模型-工具循环、消息历史、确定性上下文压缩、JSONL 会话恢复、有界重试和多重终止条件。终端逐项显示实际文件、行号、命令、退出码和结果摘要，而非笼统步数。五个本地工具支持目录、读取、搜索、原子写入和无 Shell 命令；路径限制在工作区，敏感文件被拦截，更新需匹配读取时 SHA-256，写入和命令默认确认，子进程移除密钥变量。测试覆盖正常闭环、流式分片、空响应、断流、异常恢复和安全边界；另以真实 API 完成工具调用、结果回填及修复测试任务。局限：仅处理 UTF-8 文本，防误操作机制不是操作系统沙箱。

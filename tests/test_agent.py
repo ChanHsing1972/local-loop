@@ -64,10 +64,18 @@ def test_complete_multi_turn_run_and_resume_history(tmp_path):
         ]
     )
     store, messages = create_new_session(workspace=tmp_path, task="fix bug", model="fake")
-    result = engine(tmp_path, provider).run(messages, store)
+    events = []
+    agent = engine(tmp_path, provider)
+    agent.output_fn = events.append
+    result = agent.run(messages, store)
     assert result.status is RunStatus.COMPLETED
     assert result.steps == 3
     assert target.read_text() == "good\n"
+    assert events[0].startswith("[模型] 正在分析任务")
+    assert any("[工具] 读取 bug.py 第 1-400 行" in event for event in events)
+    assert any("[工具成功] 已读取 bug.py 第 1-1 行" in event for event in events)
+    assert any("运行 python3 -c" in event for event in events)
+    assert any("退出码 0；输出：tests passed" in event for event in events)
     resumed_store, resumed_messages = resume_session(
         workspace=tmp_path, session_id=store.session_id
     )

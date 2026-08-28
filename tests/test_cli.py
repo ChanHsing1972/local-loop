@@ -9,13 +9,21 @@ from localloop.session import SessionError
 from localloop.types import AssistantTurn, RunResult, RunStatus, ToolCall
 
 
-def test_doctor_without_key_is_actionable(monkeypatch, capsys):
+def test_doctor_without_key_is_actionable(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("LLM_API_KEY", raising=False)
     monkeypatch.delenv("LLM_MODEL", raising=False)
     assert main(["doctor"]) == 2
     captured = capsys.readouterr()
     assert "API 密钥：未设置" in captured.out
     assert "新签发" in captured.err
+
+
+def test_doctor_reports_malformed_dotenv(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text("BROKEN LINE\n", encoding="utf-8")
+    assert main(["doctor"]) == 2
+    assert "KEY=VALUE" in capsys.readouterr().err
 
 
 def test_run_requires_exactly_task_or_resume(capsys):
@@ -26,6 +34,7 @@ def test_run_requires_exactly_task_or_resume(capsys):
 
 
 def test_run_reports_missing_configuration(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("LLM_API_KEY", raising=False)
     assert main(["run", "task", "--workspace", str(tmp_path)]) == 2
     assert "LLM_API_KEY" in capsys.readouterr().err
@@ -178,6 +187,7 @@ def test_default_and_chat_commands_launch_interactive_shell(tmp_path, monkeypatc
 
 
 def test_default_interactive_reports_missing_configuration(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("LLM_API_KEY", raising=False)
     assert main(["--workspace", str(tmp_path)]) == 2
     assert "配置错误" in capsys.readouterr().err

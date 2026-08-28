@@ -23,14 +23,11 @@ def test_prepare_demo_rejects_nonempty_destination(tmp_path):
         prepare_demo(destination)
 
 
-def test_online_release_check_accepts_public_neutral_github_account():
+def test_online_release_check_accepts_public_repository():
     def handler(request: httpx.Request) -> httpx.Response:
         if "/repos/" in request.url.path:
             return httpx.Response(200, json={"private": False})
-        return httpx.Response(
-            200,
-            json={"name": None, "bio": None, "company": None, "location": None, "blog": ""},
-        )
+        raise AssertionError(f"unexpected request: {request.url}")
 
     failures = []
     with httpx.Client(transport=httpx.MockTransport(handler)) as client:
@@ -42,11 +39,11 @@ def test_online_release_check_accepts_public_neutral_github_account():
     assert failures == []
 
 
-def test_online_release_check_reports_private_repo_and_profile_fields():
+def test_online_release_check_reports_private_repository():
     def handler(request: httpx.Request) -> httpx.Response:
         if "/repos/" in request.url.path:
             return httpx.Response(404, json={"message": "Not Found"})
-        return httpx.Response(200, json={"name": "identity", "company": "school"})
+        raise AssertionError(f"unexpected request: {request.url}")
 
     failures = []
     with httpx.Client(transport=httpx.MockTransport(handler)) as client:
@@ -54,6 +51,5 @@ def test_online_release_check_reports_private_repo_and_profile_fields():
             "仓库地址：https://github.com/account/local-loop",
             failures,
             client=client,
-        )
+    )
     assert any("无法匿名读取" in failure for failure in failures)
-    assert any("name" in failure and "company" in failure for failure in failures)

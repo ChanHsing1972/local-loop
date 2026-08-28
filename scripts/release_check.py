@@ -26,6 +26,7 @@ SECRET_PATTERNS = {
 }
 IDENTITY_PATH_PATTERN = re.compile(rb"/(?:Users|home)/[^/\s]+/")
 GITHUB_REPOSITORY_PATTERN = re.compile(r"https://github\.com/([^/\s]+)/([^/\s]+)")
+EXPECTED_GIT_IDENTITY = "Liu Yuxuan <231880433@smail.nju.edu.cn>"
 
 
 def git_bytes(*arguments: str) -> bytes:
@@ -70,10 +71,6 @@ def check_online_repository(
                 f"https://api.github.com/repos/{owner}/{repository}",
                 headers=headers,
             )
-            profile_response = http_client.get(
-                f"https://api.github.com/users/{owner}",
-                headers=headers,
-            )
         except httpx.HTTPError as exc:
             failures.append(f"无法完成 GitHub 匿名检查：{exc}")
             return
@@ -89,28 +86,14 @@ def check_online_repository(
         repository_payload = repository_response.json()
         if repository_payload.get("private") is not False:
             failures.append("GitHub 仓库仍被标记为非公开")
-    if profile_response.status_code != 200:
-        failures.append(f"无法匿名读取 GitHub 账号主页（HTTP {profile_response.status_code}）")
-        return
-    profile = profile_response.json()
-    identifying_fields = [
-        field
-        for field in ("name", "bio", "company", "location", "blog")
-        if profile.get(field)
-    ]
-    if identifying_fields:
-        failures.append(
-            "GitHub 账号公开资料仍填写了可能识别身份的字段："
-            + "、".join(identifying_fields)
-        )
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="检查仓库、历史、材料与双盲发布门槛")
+    parser = argparse.ArgumentParser(description="检查仓库、历史、材料与公开发布门槛")
     parser.add_argument(
         "--online",
         action="store_true",
-        help="额外匿名检查 GitHub 仓库可见性与账号公开资料",
+        help="额外从匿名视角检查 GitHub 仓库可见性",
     )
     args = parser.parse_args(argv)
     failures: list[str] = []
@@ -147,15 +130,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.online:
         check_online_repository(readme_text, failures)
 
-    authors = {
-        line
-        for line in git_bytes("log", "--format=%an <%ae>").decode().splitlines()
-        if line
-    }
-    expected_author = "Candidate <candidate@users.noreply.github.com>"
-    unexpected_authors = sorted(authors - {expected_author})
-    if unexpected_authors:
-        failures.append("提交历史存在非中性作者信息：" + "、".join(unexpected_authors))
+    identities: set[str] = set()
+    for line in git_bytes("log", "--all", "--format=%an <%ae>%x09%cn <%ce>").decode().splitlines():
+        if not line:
+            continue
+        author, committer = line.split("\t", 1)
+        identities.update((author, committer))
+    unexpected_identities = sorted(identities - {EXPECTED_GIT_IDENTITY})
+    if unexpected_identities:
+        failures.append(
+            "提交历史存在非指定 Author/Committer：" + "、".join(unexpected_identities)
+        )
 
     if failures:
         print("发布验收失败：")

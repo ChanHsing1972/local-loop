@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "localloop-agent"
-version = "0.2.0"
+version = "0.3.0"
 description = "一个具有交互式终端与本地工具执行能力的可审计编程智能体。"
 readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}
-authors = [{name = "Candidate"}]
+authors = [{name = "Liu Yuxuan", email = "231880433@smail.nju.edu.cn"}]
 dependencies = [
   "httpx>=0.27,<1",
   "openai>=1.40,<3",
