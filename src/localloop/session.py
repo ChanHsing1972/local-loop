@@ -83,6 +83,19 @@ class SessionStore:
     def append_message(self, message: Message) -> None:
         self.append("message", {"message": message})
 
+    def delete(self) -> None:
+        """删除单个会话文件；调用方应先取得用户确认。"""
+
+        if self.path.is_symlink():
+            raise SessionError("会话文件不能是符号链接")
+        try:
+            self.path.unlink()
+        except FileNotFoundError as exc:
+            raise SessionError(f"Session not found: {self.session_id}") from exc
+        except OSError as exc:
+            detail = exc.strerror or type(exc).__name__
+            raise SessionError(f"Cannot delete session: {detail}") from exc
+
     def load(self) -> SessionData:
         metadata: JsonObject | None = None
         messages: list[Message] = []

@@ -3,13 +3,21 @@ from __future__ import annotations
 import json
 import shlex
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 
 from localloop.context import ContextBudgetError, ContextManager
 from localloop.provider import ProviderError
 from localloop.session import SessionStore
 from localloop.tools import LocalTools
-from localloop.types import ChatProvider, Message, RunResult, RunStatus, ToolResult
+from localloop.types import (
+    AssistantTurn,
+    ChatProvider,
+    Message,
+    RunResult,
+    RunStatus,
+    ToolCall,
+    ToolResult,
+)
 
 SYSTEM_PROMPT = """你是 LocalLoop，一个仅在指定工作区内工作的编程智能体。
 请使用提供的本地工具检查项目、完成聚焦的修改并验证结果。始终使用用户的语言回答。
@@ -61,26 +69,9 @@ class AgentEngine:
                     "智能体已达到总时间限制并停止。",
                     step - 1,
                 )
-            if step == 1:
-                activity = "正在分析任务、历史上下文和可用工具"
-            else:
-                activity = "正在根据上一项本地结果决定下一步"
-            self.output_fn(f"[模型] {activity}（第 {step} 次模型调用）…")
+            self.output_fn(f"[模型] 思考中（{step}）…")
             try:
-                request_messages = self.context.prepare(messages)
-                stream_method = getattr(self.provider, "stream", None)
-                if self.stream_fn is not None and callable(stream_method):
-                    try:
-                        turn = stream_method(
-                            request_messages,
-                            self.tools.definitions,
-                            on_text_delta=self.stream_fn,
-                            on_retry=lambda detail: self.output_fn(f"[重试] {detail}"),
-                        )
-                    finally:
-                        self.stream_end_fn()
-                else:
-                    turn = self.provider.complete(request_messages, self.tools.definitions)
+                turn = self._request_model(messages)
             except (ProviderError, ContextBudgetError) as exc:
                 return self._finish(session, RunStatus.ERROR, str(exc), step - 1)
             except KeyboardInterrupt:
@@ -98,67 +89,21 @@ class AgentEngine:
                 session.append("usage", {"step": step, "usage": turn.usage})
 
             if not turn.tool_calls:
-                if turn.finish_reason == "length":
-                    return self._finish(
-                        session,
-                        RunStatus.ERROR,
-                        "模型输出在任务完成前被截断。",
-                        step,
-                    )
-                if turn.content.strip():
-                    if self.stream_fn is None or not callable(
-                        getattr(self.provider, "stream", None)
-                    ):
-                        self.output_fn(turn.content)
-                    return self._finish(
-                        session, RunStatus.COMPLETED, turn.content.strip(), step
-                    )
-                reason = f" (finish_reason={turn.finish_reason})" if turn.finish_reason else ""
-                return self._finish(
-                    session,
-                    RunStatus.ERROR,
-                    "模型既未返回文本，也未返回工具调用" + reason,
-                    step,
-                )
+                return self._finish_text_turn(turn, session, step)
 
-            normalized_calls = []
-            for call in turn.tool_calls:
-                try:
-                    normalized_arguments = json.dumps(
-                        json.loads(call.arguments),
-                        ensure_ascii=False,
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    )
-                except json.JSONDecodeError:
-                    normalized_arguments = call.arguments
-                normalized_calls.append((call.name, normalized_arguments))
-            signature = json.dumps(
-                normalized_calls,
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
+            signature = _tool_call_signature(turn.tool_calls)
             if signature == last_signature:
                 repeated += 1
             else:
                 last_signature = signature
                 repeated = 1
             if repeated >= 3:
-                for call in turn.tool_calls:
-                    repeated_result = ToolResult(
-                        tool_call_id=call.id,
-                        name=call.name,
-                        ok=False,
-                        content=json.dumps(
-                            {
-                                "ok": False,
-                                "error": "相同工具调用已连续出现三次，本次未执行并终止循环",
-                            },
-                            ensure_ascii=False,
-                        ),
-                    ).as_message()
-                    messages.append(repeated_result)
-                    session.append_message(repeated_result)
+                _append_failed_tool_results(
+                    messages,
+                    session,
+                    turn.tool_calls,
+                    "相同工具调用已连续出现三次，本次未执行并终止循环",
+                )
                 return self._finish(
                     session,
                     RunStatus.REPEATED_CALL,
@@ -166,38 +111,13 @@ class AgentEngine:
                     step,
                 )
 
-            for call_index, call in enumerate(turn.tool_calls):
-                self.output_fn(f"[工具] {_describe_tool_call(call.name, call.arguments)}")
-                try:
-                    result = self.tools.execute(call)
-                except KeyboardInterrupt:
-                    for pending_call in turn.tool_calls[call_index:]:
-                        interrupted_result = ToolResult(
-                            tool_call_id=pending_call.id,
-                            name=pending_call.name,
-                            ok=False,
-                            content=json.dumps(
-                                {
-                                    "ok": False,
-                                    "error": "用户中断了工具执行；当前或本批次剩余调用未正常完成",
-                                },
-                                ensure_ascii=False,
-                            ),
-                        )
-                        interrupted_message = interrupted_result.as_message()
-                        messages.append(interrupted_message)
-                        session.append_message(interrupted_message)
-                    return self._finish(
-                        session,
-                        RunStatus.INTERRUPTED,
-                        "运行已中断；可使用 --resume " + session.session_id + " 继续",
-                        step,
-                    )
-                result_message = result.as_message()
-                messages.append(result_message)
-                session.append_message(result_message)
-                status = "成功" if result.ok else "失败"
-                self.output_fn(f"[工具{status}] {_describe_tool_result(call.name, result.content)}")
+            if not self._execute_tools(turn.tool_calls, messages, session):
+                return self._finish(
+                    session,
+                    RunStatus.INTERRUPTED,
+                    "运行已中断；可使用 --resume " + session.session_id + " 继续",
+                    step,
+                )
 
         return self._finish(
             session,
@@ -205,6 +125,66 @@ class AgentEngine:
             f"智能体达到 {self.max_steps} 步限制，已停止运行。",
             self.max_steps,
         )
+
+    def _request_model(self, messages: list[Message]) -> AssistantTurn:
+        request_messages = self.context.prepare(messages)
+        stream_method = getattr(self.provider, "stream", None)
+        if self.stream_fn is None or not callable(stream_method):
+            return self.provider.complete(request_messages, self.tools.definitions)
+        try:
+            return stream_method(
+                request_messages,
+                self.tools.definitions,
+                on_text_delta=self.stream_fn,
+                on_retry=lambda detail: self.output_fn(f"[重试] {detail}"),
+            )
+        finally:
+            self.stream_end_fn()
+
+    def _finish_text_turn(
+        self,
+        turn: AssistantTurn,
+        session: SessionStore,
+        step: int,
+    ) -> RunResult:
+        if turn.finish_reason == "length":
+            return self._finish(session, RunStatus.ERROR, "模型输出在任务完成前被截断。", step)
+        if turn.content.strip():
+            if self.stream_fn is None or not callable(getattr(self.provider, "stream", None)):
+                self.output_fn(turn.content)
+            return self._finish(session, RunStatus.COMPLETED, turn.content.strip(), step)
+        reason = f" (finish_reason={turn.finish_reason})" if turn.finish_reason else ""
+        return self._finish(
+            session,
+            RunStatus.ERROR,
+            "模型既未返回文本，也未返回工具调用" + reason,
+            step,
+        )
+
+    def _execute_tools(
+        self,
+        calls: tuple[ToolCall, ...],
+        messages: list[Message],
+        session: SessionStore,
+    ) -> bool:
+        for index, call in enumerate(calls):
+            self.output_fn(f"[工具] {_describe_tool_call(call.name, call.arguments)}")
+            try:
+                result = self.tools.execute(call)
+            except KeyboardInterrupt:
+                _append_failed_tool_results(
+                    messages,
+                    session,
+                    calls[index:],
+                    "用户中断了工具执行；当前或本批次剩余调用未正常完成",
+                )
+                return False
+            result_message = result.as_message()
+            messages.append(result_message)
+            session.append_message(result_message)
+            status = "成功" if result.ok else "失败"
+            self.output_fn(f"[工具{status}] {_describe_tool_result(call.name, result.content)}")
+        return True
 
     @staticmethod
     def _finish(
@@ -260,8 +240,13 @@ def _describe_tool_result(name: str, raw_content: str) -> str:
     if not isinstance(payload, dict):
         return f"{name} · 返回内容不是对象"
     if payload.get("ok") is False:
+        if name == "run_command" and "exit_code" in payload:
+            return _command_result_summary(payload)
         detail = str(payload.get("error", "未知错误")).replace("\n", " ")
-        return f"{name} · {detail[:300]}"
+        output = str(payload.get("output", "")).strip()
+        if output:
+            detail += "\n" + output
+        return _error_result_summary(name, detail)
     if name == "read_file":
         return (
             f"已读取 {payload.get('path', '?')} 第 {payload.get('start_line', '?')}-"
@@ -275,11 +260,66 @@ def _describe_tool_result(name: str, raw_content: str) -> str:
         action = "已创建" if payload.get("created") else "已更新"
         return f"{action} {payload.get('path', '?')}，写入 {payload.get('bytes_written', '?')} 字节"
     if name == "run_command":
-        output = str(payload.get("stdout") or payload.get("stderr") or "").strip()
-        preview = " ".join(output.split())[:300]
-        suffix = f"；输出：{preview}" if preview else ""
-        return f"退出码 {payload.get('exit_code', '?')}{suffix}"
+        return _command_result_summary(payload)
     return name
+
+
+def _command_result_summary(payload: dict) -> str:
+    stdout = str(payload.get("stdout") or "").strip()
+    stderr = str(payload.get("stderr") or "").strip()
+    output = f"stdout:\n{stdout}\nstderr:\n{stderr}" if stdout and stderr else stdout or stderr
+    suffix = f"；输出：\n{_indented_preview(output)}" if output else ""
+    return f"退出码 {payload.get('exit_code', '?')}{suffix}"
+
+
+def _error_result_summary(name: str, detail: str) -> str:
+    preview = detail[:600]
+    if len(detail) > 600:
+        preview += "\n…"
+    first, *rest = preview.splitlines() or [""]
+    suffix = "".join(f"\n    {line}" for line in rest)
+    return f"{name} · {first}{suffix}"
+
+
+def _indented_preview(text: str, limit: int = 600) -> str:
+    preview = text[:limit]
+    if len(text) > limit:
+        preview += "\n…"
+    return "\n".join(f"    {line}" for line in preview.splitlines())
+
+
+def _tool_call_signature(calls: Iterable[ToolCall]) -> str:
+    normalized = []
+    for call in calls:
+        try:
+            arguments = json.dumps(
+                json.loads(call.arguments),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        except json.JSONDecodeError:
+            arguments = call.arguments
+        normalized.append((call.name, arguments))
+    return json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
+
+
+def _append_failed_tool_results(
+    messages: list[Message],
+    session: SessionStore,
+    calls: Iterable[ToolCall],
+    error: str,
+) -> None:
+    for call in calls:
+        message = ToolResult(
+            tool_call_id=call.id,
+            name=call.name,
+            ok=False,
+            content=json.dumps({"ok": False, "error": error}, ensure_ascii=False),
+        ).as_message()
+        messages.append(message)
+        session.append_message(message)
+
 
 def create_new_session(
     *, workspace, task: str, model: str

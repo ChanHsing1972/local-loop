@@ -109,10 +109,7 @@ class OpenAIChatProvider:
                     request["stream"] = True
                 response = self.client.chat.completions.create(**request)
                 if streaming:
-                    turn, _received = self._parse_stream(
-                        response, on_text_delta, stream_state=stream_state
-                    )
-                    return turn
+                    return self._parse_stream(response, on_text_delta, stream_state=stream_state)
                 return self._parse_response(response)
             except (AuthenticationError, PermissionDeniedError, BadRequestError) as exc:
                 raise ProviderError(_safe_error(exc, self.api_key)) from exc
@@ -237,12 +234,11 @@ class OpenAIChatProvider:
         on_text_delta: Callable[[str], None],
         *,
         stream_state: list[bool] | None = None,
-    ) -> tuple[AssistantTurn, bool]:
+    ) -> AssistantTurn:
         content_parts: list[str] = []
         calls: dict[int, dict[str, str]] = {}
         finish_reason: str | None = None
         usage: JsonObject | None = None
-        received = False
         try:
             for chunk in response:
                 if isinstance(chunk, Mapping):
@@ -256,7 +252,6 @@ class OpenAIChatProvider:
                     )
                 choices = OpenAIChatProvider._field(chunk, "choices", []) or []
                 for choice in choices:
-                    received = True
                     if stream_state is not None:
                         stream_state[0] = True
                     reason = OpenAIChatProvider._field(choice, "finish_reason")
@@ -306,7 +301,7 @@ class OpenAIChatProvider:
         )
         if not turn.content.strip() and not turn.tool_calls:
             raise _RetryableResponseError("流中没有文本或工具调用")
-        return turn, received
+        return turn
 
     @staticmethod
     def _field(value: Any, name: str, default: Any = None) -> Any:

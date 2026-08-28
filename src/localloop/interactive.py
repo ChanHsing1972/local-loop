@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import os
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any
 
 from prompt_toolkit import PromptSession
+from prompt_toolkit.application.current import get_app
 from prompt_toolkit.completion import CompleteEvent, Completer, Completion
 from prompt_toolkit.document import Document
+from prompt_toolkit.filters import Condition
 from prompt_toolkit.formatted_text import AnyFormattedText
 from prompt_toolkit.history import FileHistory
+from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.shortcuts import CompleteStyle
 from prompt_toolkit.styles import Style
 from rich.console import Console
@@ -27,20 +30,30 @@ from localloop.session import SessionError, SessionStore
 from localloop.tools import LocalTools
 from localloop.types import AgentConfig, ChatProvider, Message, RunStatus
 
-COMMAND_HELP = (
-    ("/help", "/help", "显示全部交互命令"),
-    ("/status", "/status", "显示模型、工作区、审批模式和当前会话"),
-    ("/new", "/new", "结束当前上下文，下一条输入创建新会话"),
-    ("/resume", "/resume ID", "恢复指定会话"),
-    ("/sessions", "/sessions", "列出最近会话"),
-    ("/models", "/models", "从网关获取可用模型"),
-    ("/model", "/model ID", "切换当前交互会话使用的模型"),
-    ("/approval", "/approval ask|auto", "切换逐次确认或自动批准"),
-    ("/clear", "/clear", "清屏并重新显示启动信息"),
-    ("/exit", "/exit", "退出 LocalLoop"),
-    ("/quit", "/quit", "退出 LocalLoop（/exit 的别名）"),
+
+@dataclass(frozen=True, slots=True)
+class CommandSpec:
+    """斜杠命令的唯一元数据来源，供补全菜单和 `/help` 共用。"""
+
+    name: str
+    usage: str
+    description: str
+
+
+COMMANDS = (
+    CommandSpec("/help", "/help", "显示全部交互命令"),
+    CommandSpec("/status", "/status", "显示模型、工作区、审批模式和当前会话"),
+    CommandSpec("/new", "/new", "结束当前上下文，下一条输入创建新会话"),
+    CommandSpec("/resume", "/resume ID", "恢复指定会话"),
+    CommandSpec("/sessions", "/sessions", "列出最近会话"),
+    CommandSpec("/delete", "/delete ID", "删除指定会话记录"),
+    CommandSpec("/models", "/models", "从网关获取可用模型"),
+    CommandSpec("/model", "/model ID", "切换当前交互会话使用的模型"),
+    CommandSpec("/approval", "/approval ask|auto", "切换逐次确认或自动批准"),
+    CommandSpec("/clear", "/clear", "清屏并重新显示启动信息"),
+    CommandSpec("/exit", "/exit", "退出 LocalLoop"),
+    CommandSpec("/quit", "/quit", "退出 LocalLoop（/exit 的别名）"),
 )
-COMMANDS = tuple(command for command, _usage, _description in COMMAND_HELP)
 
 
 class SlashCommandCompleter(Completer):
@@ -55,15 +68,56 @@ class SlashCommandCompleter(Completer):
         text = document.text_before_cursor
         if not text.startswith("/") or any(character.isspace() for character in text):
             return
-        for command, usage, description in COMMAND_HELP:
-            if command.startswith(text):
-                display: AnyFormattedText = [("class:completion.command", usage)]
+        for command in COMMANDS:
+            if command.name.startswith(text):
+                display: AnyFormattedText = [("class:completion.command", command.usage)]
                 yield Completion(
-                    command,
+                    command.name,
                     start_position=-len(text),
                     display=display,
-                    display_meta=description,
+                    display_meta=command.description,
                 )
+
+
+def _command_key_bindings() -> KeyBindings:
+    """在首字符 `/` 被输入的同一个按键事件中打开补全菜单。
+
+    `complete_while_typing` 只在部分终端和输入后端中可靠触发；显式绑定
+    `/` 可以保证菜单不会因为输入事件或终端刷新时序而静默消失。
+    """
+
+    bindings = KeyBindings()
+
+    @bindings.add("/", eager=True)
+    def open_command_menu(event) -> None:
+        buffer = event.current_buffer
+        buffer.insert_text("/")
+        if len(buffer.text) == 1:
+            buffer.start_completion(select_first=True)
+
+    @bindings.add("enter", eager=True)
+    def execute_selected_command(event) -> None:
+        """选中补全项后按一次 Enter，补全并立即提交该命令。"""
+
+        buffer = event.current_buffer
+        state = buffer.complete_state
+        if state is not None and state.completions:
+            selected = state.current_completion or state.completions[0]
+            buffer.apply_completion(selected)
+        buffer.validate_and_handle()
+
+    return bindings
+
+
+def _is_command_prefix(text: str) -> bool:
+    return text.startswith("/") and not any(character.isspace() for character in text)
+
+
+def _complete_commands_while_typing() -> Condition:
+    """只在输入斜杠命令时启用动态补全与菜单空间。"""
+
+    return Condition(lambda: _is_command_prefix(get_app().current_buffer.text))
+
 
 STATUS_LABELS = {
     RunStatus.COMPLETED: "已完成",
@@ -117,8 +171,10 @@ class InteractiveShell:
         self.prompt_session = prompt_session or PromptSession(
             history=FileHistory(str(history_path)),
             completer=SlashCommandCompleter(),
-            complete_while_typing=True,
+            key_bindings=_command_key_bindings(),
+            complete_while_typing=_complete_commands_while_typing(),
             complete_style=CompleteStyle.COLUMN,
+            # 只有上面的动态条件成立或菜单已打开时，prompt-toolkit 才使用这些行。
             reserve_space_for_menu=len(COMMANDS),
             style=Style.from_dict(
                 {
@@ -249,6 +305,11 @@ class InteractiveShell:
                 self.resume(argument)
         elif command == "/sessions":
             self._show_sessions()
+        elif command == "/delete":
+            if not argument:
+                self.console.print("用法：/delete 会话编号", style="yellow")
+            else:
+                self._delete_session(argument)
         elif command == "/models":
             self._show_models()
         elif command == "/model":
@@ -273,15 +334,33 @@ class InteractiveShell:
             return False
         self.session = store
         self.messages = messages
-        self.console.print(f"已恢复会话 [cyan]{session_id}[/cyan]，可继续输入任务。")
+        self.console.print(f"已恢复会话 [cyan]{session_id}[/cyan]。")
+        self._show_conversation_history(messages)
+        self.console.print("历史已恢复，可继续输入任务。", style="green")
         return True
+
+    def _show_conversation_history(self, messages: list[Message]) -> None:
+        visible = [
+            (str(message.get("role")), str(message.get("content")))
+            for message in messages
+            if message.get("role") in {"user", "assistant"}
+            and isinstance(message.get("content"), str)
+            and str(message.get("content")).strip()
+        ]
+        self.console.print("── 历史对话 ──", style="dim")
+        for role, content in visible:
+            if role == "user":
+                self.console.print(f"› {content}", style="bold cyan", markup=False)
+            else:
+                self.console.print(Markdown(content))
+        self.console.print("── 历史结束 ──", style="dim")
 
     def _show_help(self) -> None:
         table = Table(title="可用命令", show_header=False, box=None)
         table.add_column(style="cyan", no_wrap=True)
         table.add_column()
-        for _command, usage, description in COMMAND_HELP:
-            table.add_row(usage, description)
+        for command in COMMANDS:
+            table.add_row(command.usage, command.description)
         self.console.print(table)
 
     def _show_status(self) -> None:
@@ -319,6 +398,29 @@ class InteractiveShell:
                 task, model = "记录损坏", "-"
             table.add_row(session_id, task[:48], model)
         self.console.print(table)
+
+    def _delete_session(self, session_id: str) -> None:
+        try:
+            store = SessionStore.open(self.config.workspace, session_id)
+        except SessionError as exc:
+            self.console.print(f"无法删除会话：{exc}", style="bold red")
+            return
+        try:
+            answer = self.approval_input(f"确定删除会话 {session_id}？[y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            answer = ""
+        if answer not in {"y", "yes", "是"}:
+            self.console.print("已取消删除。", style="dim")
+            return
+        try:
+            store.delete()
+        except SessionError as exc:
+            self.console.print(f"无法删除会话：{exc}", style="bold red")
+            return
+        if self.session and self.session.session_id == session_id:
+            self.session = None
+            self.messages = None
+        self.console.print(f"已删除会话 [cyan]{session_id}[/cyan]。", style="green")
 
     def _show_models(self) -> None:
         self.console.print("正在查询模型…", style="dim cyan")

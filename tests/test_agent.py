@@ -4,7 +4,7 @@ import hashlib
 
 from conftest import make_call
 
-from localloop.agent import AgentEngine, create_new_session, resume_session
+from localloop.agent import AgentEngine, _describe_tool_result, create_new_session, resume_session
 from localloop.context import ContextManager
 from localloop.policy import AlwaysApprovePolicy
 from localloop.provider import ProviderError
@@ -71,11 +71,11 @@ def test_complete_multi_turn_run_and_resume_history(tmp_path):
     assert result.status is RunStatus.COMPLETED
     assert result.steps == 3
     assert target.read_text() == "good\n"
-    assert events[0].startswith("[模型] 正在分析任务")
+    assert events[0] == "[模型] 思考中（1）…"
     assert any("[工具] 读取 bug.py 第 1-400 行" in event for event in events)
     assert any("[工具成功] 已读取 bug.py 第 1-1 行" in event for event in events)
     assert any("运行 python3 -c" in event for event in events)
-    assert any("退出码 0；输出：tests passed" in event for event in events)
+    assert any("退出码 0；输出：\n    tests passed" in event for event in events)
     resumed_store, resumed_messages = resume_session(
         workspace=tmp_path, session_id=store.session_id
     )
@@ -225,3 +225,28 @@ def test_resume_repairs_trailing_incomplete_tool_calls_once(tmp_path):
         session_id=store.session_id,
     )
     assert [message.get("tool_call_id") for message in resumed_again].count("second") == 1
+
+
+def test_command_result_summary_preserves_lines_and_failure_details():
+    success = _describe_tool_result(
+        "run_command",
+        '{"ok":true,"exit_code":0,"stdout":"first\\nsecond\\n","stderr":""}',
+    )
+    assert "输出：\n    first\n    second" in success
+
+    failure = _describe_tool_result(
+        "run_command",
+        '{"ok":false,"exit_code":1,"stdout":"","stderr":"linker error\\nmore detail"}',
+    )
+    assert failure == "退出码 1；输出：\n    linker error\n    more detail"
+
+    both_streams = _describe_tool_result(
+        "run_command",
+        '{"ok":false,"exit_code":2,"stdout":"partial","stderr":"actual error"}',
+    )
+    assert "stdout:\n    partial\n    stderr:\n    actual error" in both_streams
+
+    ordinary_error = _describe_tool_result(
+        "write_file", '{"ok":false,"error":"file changed"}'
+    )
+    assert ordinary_error == "write_file · file changed"

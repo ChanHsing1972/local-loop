@@ -28,6 +28,14 @@ def test_invalid_and_missing_session(tmp_path):
         SessionStore.open(tmp_path, "abcdef123456")
 
 
+def test_session_can_be_deleted(tmp_path):
+    store = SessionStore.create(tmp_path, task="delete me", model="model")
+    store.delete()
+    assert not store.path.exists()
+    with pytest.raises(SessionError, match="not found"):
+        store.delete()
+
+
 def test_corrupt_session_is_rejected(tmp_path):
     store = SessionStore.create(tmp_path, task="task", model="model")
     with store.path.open("a") as stream:
@@ -90,3 +98,6 @@ def test_session_file_rejects_symbolic_link(tmp_path):
     (directory / f"{session_id}.jsonl").symlink_to(outside)
     with pytest.raises(SessionError, match="symbolic link"):
         SessionStore.open(tmp_path, session_id)
+    with pytest.raises(SessionError, match="符号链接"):
+        SessionStore(tmp_path, session_id).delete()
+    assert outside.read_text(encoding="utf-8") == "keep"
