@@ -1,3 +1,10 @@
+"""LocalLoop 命令行入口与三种运行模式。
+
+``localloop``/``localloop chat`` 启动持续交互界面，``localloop run`` 执行单个任务，
+``localloop doctor`` 检查网关、模型列表和原生工具调用能力。本模块负责解析参数、组装
+依赖和映射退出码，不包含 Agent 决策逻辑。
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -34,6 +41,8 @@ class ChineseArgumentParser(argparse.ArgumentParser):
 
 
 def _add_runtime_options(parser: argparse.ArgumentParser, *, include_resume: bool = True) -> None:
+    """给顶层、chat 和 run 子命令复用同一组运行参数。"""
+
     parser.add_argument("--workspace", "-C", default=".", help="工作区根目录")
     if include_resume:
         parser.add_argument("--resume", metavar="SESSION_ID", help="恢复已有会话")
@@ -53,6 +62,8 @@ def _add_runtime_options(parser: argparse.ArgumentParser, *, include_resume: boo
 
 
 def _parser() -> argparse.ArgumentParser:
+    """构造完整参数树；单独封装便于测试帮助文本而不启动程序。"""
+
     parser = ChineseArgumentParser(
         prog="localloop",
         description="具有本地工具执行能力的交互式编程智能体。",
@@ -83,6 +94,12 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _doctor(skip_tool_check: bool) -> int:
+    """逐层诊断本地配置、模型列表和一次完整的原生工具调用往返。
+
+    返回 0 表示所检查项目通过，返回 2 表示配置或网关能力不满足运行要求。诊断始终只
+    显示“密钥是否存在”，不会打印密钥值。
+    """
+
     try:
         environment = load_environment()
     except ConfigError as exc:
@@ -124,6 +141,7 @@ def _doctor(skip_tool_check: bool) -> int:
         return 0
 
     provider = OpenAIChatProvider(api_key=api_key, base_url=base_url, model=model)
+    # 使用无副作用的虚拟函数验证模型能否返回协议正确的 tool_call。
     test_tool = {
         "type": "function",
         "function": {
@@ -156,6 +174,7 @@ def _doctor(skip_tool_check: bool) -> int:
         print("错误：模型没有返回原生函数调用", file=sys.stderr)
         return 2
     call = turn.tool_calls[0]
+    # 第二次请求把虚拟执行结果按相同 call.id 回填，验证模型能结束工具回合。
     probe_messages.extend(
         [
             turn.as_message(),
@@ -180,6 +199,8 @@ def _doctor(skip_tool_check: bool) -> int:
 
 
 def _load_runtime_config(args: argparse.Namespace):
+    """把 argparse 命名空间中的公共选项转交给配置层校验。"""
+
     return load_config(
         args.workspace,
         max_steps=args.max_steps,
@@ -189,6 +210,8 @@ def _load_runtime_config(args: argparse.Namespace):
 
 
 def _interactive(args: argparse.Namespace) -> int:
+    """启动交互外壳，并把配置/本地状态错误转换为稳定的进程退出码。"""
+
     try:
         config = _load_runtime_config(args)
     except ConfigError as exc:
@@ -205,6 +228,8 @@ def _interactive(args: argparse.Namespace) -> int:
 
 
 def _run(args: argparse.Namespace) -> int:
+    """执行一个非交互任务或恢复指定会话，适合脚本和演示录制。"""
+
     if args.resume and args.task:
         print("错误：使用 --resume 时请不要再提供 TASK", file=sys.stderr)
         return 2
@@ -222,9 +247,7 @@ def _run(args: argparse.Namespace) -> int:
 
     try:
         if args.resume:
-            session, messages = resume_session(
-                workspace=config.workspace, session_id=args.resume
-            )
+            session, messages = resume_session(workspace=config.workspace, session_id=args.resume)
         else:
             session, messages = create_new_session(
                 workspace=config.workspace, task=args.task, model=config.model
@@ -241,10 +264,9 @@ def _run(args: argparse.Namespace) -> int:
         model=config.model,
     )
     policy = InteractiveApprovalPolicy(auto_approve=config.auto_approve)
+    # CLI 在这里完成依赖组装：每层只拿到自己需要的对象，保持职责边界清晰。
     tools = LocalTools(config.workspace, policy)
-    context = ContextManager(
-        max_chars=config.max_context_chars, recent_groups=config.recent_groups
-    )
+    context = ContextManager(max_chars=config.max_context_chars, recent_groups=config.recent_groups)
     engine = AgentEngine(
         provider=provider,
         tools=tools,
@@ -255,10 +277,7 @@ def _run(args: argparse.Namespace) -> int:
         stream_end_fn=lambda: print(),
     )
     result = engine.run(messages, session)
-    print(
-        f"状态：{STATUS_LABELS[result.status]}；步骤：{result.steps}；"
-        f"会话：{result.session_id}"
-    )
+    print(f"状态：{STATUS_LABELS[result.status]}；步骤：{result.steps}；会话：{result.session_id}")
     if result.status is not RunStatus.COMPLETED:
         print(result.final_output, file=sys.stderr)
         return 1
@@ -266,6 +285,8 @@ def _run(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """解析命令并分派模式；返回值由控制台脚本或 ``__main__`` 交给操作系统。"""
+
     parser = _parser()
     args = parser.parse_args(argv)
     if args.command == "doctor":

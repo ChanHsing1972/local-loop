@@ -1,3 +1,10 @@
+"""连接 OpenAI 兼容 Chat Completions 网关并规范化响应。
+
+这个“提供者层”只处理 HTTP 客户端、重试、流式分片和协议解析；它不知道工作区，也不
+执行工具。``AgentEngine`` 只接收本模块产出的 ``AssistantTurn``，从而把不稳定的外部
+响应隔离在一个地方。项目允许使用 OpenAI 客户端库，但 Agent 循环仍由本地代码实现。
+"""
+
 from __future__ import annotations
 
 import json
@@ -29,12 +36,14 @@ class _RetryableResponseError(ValueError):
 
 
 def _safe_error(error: BaseException, api_key: str) -> str:
+    """生成可展示的有限长度错误文本，并把当前 API 密钥替换为脱敏标记。"""
+
     text = str(error).replace(api_key, "[REDACTED]")
     return text[:1_000]
 
 
 class OpenAIChatProvider:
-    """仅负责接口传输；所有编排逻辑均由 AgentEngine 自行实现。"""
+    """OpenAI 兼容网关适配器；所有 Agent 编排逻辑均由 ``AgentEngine`` 实现。"""
 
     def __init__(
         self,
@@ -47,6 +56,12 @@ class OpenAIChatProvider:
         sleeper: Callable[[float], None] = time.sleep,
         client: Any | None = None,
     ) -> None:
+        """创建提供者。
+
+        SDK 自带重试被设为 0，统一由本类控制重试次数和可观察提示，避免两层重试叠加。
+        ``client`` 和 ``sleeper`` 可注入替身，使单元测试不访问真实网络也无需真的等待。
+        """
+
         self.api_key = api_key
         self.model = model
         self.max_retries = max_retries
@@ -65,6 +80,8 @@ class OpenAIChatProvider:
         *,
         tool_choice: str | JsonObject = "auto",
     ) -> AssistantTurn:
+        """发起普通非流式请求，返回标准化的一轮模型输出。"""
+
         return self._request(messages, tools, tool_choice=tool_choice)
 
     def stream(
@@ -95,8 +112,16 @@ class OpenAIChatProvider:
         on_text_delta: Callable[[str], None] | None = None,
         on_retry: Callable[[str], None] | None = None,
     ) -> AssistantTurn:
+        """执行带有限指数退避的请求，并把底层异常转换成安全的 ``ProviderError``。
+
+        认证、权限和参数错误重试也不会自行恢复，因此立即失败；连接错误、超时、限流、
+        408/409、5xx 及空响应可以短暂重试。已经开始消费流后不再重试，以免向终端重复
+        输出文本，或让一次模型决定被误执行两遍。
+        """
+
         streaming = on_text_delta is not None
         for attempt in range(self.max_retries + 1):
+            # 用可变单元素列表让 _parse_stream 能向本层回报“已经看到 choice”。
             stream_state = [False]
             try:
                 request: dict[str, Any] = {
@@ -107,6 +132,7 @@ class OpenAIChatProvider:
                 }
                 if streaming:
                     request["stream"] = True
+                # 工具定义随每次请求发送；真正是否执行仍由本地 AgentEngine 决定。
                 response = self.client.chat.completions.create(**request)
                 if streaming:
                     return self._parse_stream(response, on_text_delta, stream_state=stream_state)
@@ -144,19 +170,18 @@ class OpenAIChatProvider:
                     ) from exc
             except (AttributeError, TypeError, ValueError) as exc:
                 raise ProviderError(
-                    "网关返回了不兼容的 Chat Completions 响应："
-                    + _safe_error(exc, self.api_key)
+                    "网关返回了不兼容的 Chat Completions 响应：" + _safe_error(exc, self.api_key)
                 ) from exc
             delay = min(2**attempt, 8)
             if on_retry:
-                on_retry(
-                    f"第 {attempt + 1} 次请求未得到可用响应，{delay} 秒后重试"
-                )
+                on_retry(f"第 {attempt + 1} 次请求未得到可用响应，{delay} 秒后重试")
             self.sleeper(delay)
         raise AssertionError("retry loop exhausted")  # pragma: no cover
 
     @staticmethod
     def _parse_response(response: Any) -> AssistantTurn:
+        """兼容 SDK 对象、字典及少数网关直接返回的字符串，并严格检查工具调用。"""
+
         if isinstance(response, str):
             text = response.strip()
             if not text:
@@ -189,6 +214,7 @@ class OpenAIChatProvider:
             call_id = OpenAIChatProvider._field(call, "id")
             if not isinstance(call_id, str) or not call_id.strip():
                 raise ValueError("工具调用缺少有效的调用编号")
+            # 重复 id 会使后续 tool 结果无法唯一对应调用，因此不能勉强接受。
             if call_id in call_ids:
                 raise ValueError(f"工具调用编号重复：{call_id}")
             call_ids.add(call_id)
@@ -235,6 +261,12 @@ class OpenAIChatProvider:
         *,
         stream_state: list[bool] | None = None,
     ) -> AssistantTurn:
+        """逐块转发正文，同时按 ``index`` 拼合被拆碎的工具调用参数。
+
+        流式协议可能把一个函数名或 JSON 参数拆到多个 chunk。``calls`` 以调用序号为键，
+        把对应片段依次连接；直到流结束才构造不可变的 ``ToolCall``。
+        """
+
         content_parts: list[str] = []
         calls: dict[int, dict[str, str]] = {}
         finish_reason: str | None = None
@@ -253,6 +285,7 @@ class OpenAIChatProvider:
                 choices = OpenAIChatProvider._field(chunk, "choices", []) or []
                 for choice in choices:
                     if stream_state is not None:
+                        # 外层据此避免对已经开始的响应再发一次请求。
                         stream_state[0] = True
                     reason = OpenAIChatProvider._field(choice, "finish_reason")
                     if reason:
@@ -283,6 +316,7 @@ class OpenAIChatProvider:
                             if isinstance(arguments, str) and arguments:
                                 aggregate["arguments"] += arguments
         finally:
+            # 无论成功还是解析失败，都尽快释放底层 HTTP 流连接。
             close = getattr(response, "close", None)
             if callable(close):
                 close()
@@ -305,12 +339,16 @@ class OpenAIChatProvider:
 
     @staticmethod
     def _field(value: Any, name: str, default: Any = None) -> Any:
+        """统一读取字典响应和 OpenAI SDK 属性对象中的同名字段。"""
+
         if isinstance(value, Mapping):
             return value.get(name, default)
         return getattr(value, name, default)
 
     @staticmethod
     def _raise_payload_error(payload: Mapping[str, Any]) -> None:
+        """识别 HTTP 200 内嵌的标准 error 或某些网关的业务错误码。"""
+
         if "error" in payload:
             error = payload["error"]
             detail = error.get("message", error) if isinstance(error, Mapping) else error
@@ -333,7 +371,11 @@ def probe_models(
     sleeper: Callable[[float], None] = time.sleep,
     client: Any | None = None,
 ) -> list[str]:
-    """探测兼容 OpenAI 的模型列表接口，并识别被包装的业务错误。"""
+    """探测兼容 OpenAI 的模型列表接口，并识别被包装的业务错误。
+
+    这里使用独立的轻量 HTTP 请求，因为只需要读取 ``GET /models``，无需创建聊天客户端。
+    响应体最多读取 2 MB，错误正文最多展示 500 字符，防止异常网关塞入过量内容。
+    """
 
     owns_client = client is None
     http_client = client or httpx.Client(timeout=timeout)
@@ -355,6 +397,7 @@ def probe_models(
                 sleeper(min(2**attempt, 8))
                 continue
             status = int(response.status_code)
+            # 对成功和错误响应都设置读取上限，避免诊断命令占用无界内存。
             raw = bytes(response.content[:2_000_000])
             if (status in {408, 409, 429} or status >= 500) and attempt < max_retries:
                 sleeper(min(2**attempt, 8))
@@ -388,6 +431,7 @@ def probe_models(
         raise ProviderError(f"模型列表接口业务错误 {payload['code']}：{safe_detail}")
 
     data = payload.get("data", [])
+    # 兼容标准列表和常见的 data.models/data.items 二次包装。
     if isinstance(data, dict):
         data = data.get("data") or data.get("models") or data.get("items") or []
     if not isinstance(data, list):

@@ -1,3 +1,10 @@
+"""基于 prompt-toolkit 与 Rich 的持续交互终端。
+
+prompt-toolkit 负责输入历史、斜杠命令补全和按键事件，Rich 负责面板、表格、Markdown
+与彩色进度。``InteractiveShell`` 保存当前会话，让用户可以连续追加任务；真正的模型循环
+仍由 ``AgentEngine`` 执行，因此界面层只处理输入、展示和运行时设置切换。
+"""
+
 from __future__ import annotations
 
 import os
@@ -41,6 +48,7 @@ class CommandSpec:
 
 
 COMMANDS = (
+    # /quit 是 /exit 的别名，因此帮助中共有 12 行、实际处理逻辑有 11 类动作。
     CommandSpec("/help", "/help", "显示全部交互命令"),
     CommandSpec("/status", "/status", "显示模型、工作区、审批模式和当前会话"),
     CommandSpec("/new", "/new", "结束当前上下文，下一条输入创建新会话"),
@@ -64,6 +72,8 @@ class SlashCommandCompleter(Completer):
         document: Document,
         complete_event: CompleteEvent,
     ):
+        """根据光标前的命令前缀逐个生成候选项；出现空格后不再干预参数输入。"""
+
         del complete_event
         text = document.text_before_cursor
         if not text.startswith("/") or any(character.isspace() for character in text):
@@ -90,6 +100,8 @@ def _command_key_bindings() -> KeyBindings:
 
     @bindings.add("/", eager=True)
     def open_command_menu(event) -> None:
+        """插入斜杠，并仅在它是首字符时主动打开全部命令菜单。"""
+
         buffer = event.current_buffer
         buffer.insert_text("/")
         if len(buffer.text) == 1:
@@ -102,6 +114,7 @@ def _command_key_bindings() -> KeyBindings:
         buffer = event.current_buffer
         state = buffer.complete_state
         if state is not None and state.completions:
+            # 某些终端菜单已打开但 current_completion 仍为 None，此时采用第一项。
             selected = state.current_completion or state.completions[0]
             buffer.apply_completion(selected)
         buffer.validate_and_handle()
@@ -110,6 +123,8 @@ def _command_key_bindings() -> KeyBindings:
 
 
 def _is_command_prefix(text: str) -> bool:
+    """判断当前输入是否仍处于“命令名补全”阶段。"""
+
     return text.startswith("/") and not any(character.isspace() for character in text)
 
 
@@ -130,6 +145,8 @@ STATUS_LABELS = {
 
 
 def _default_provider(config: AgentConfig) -> ChatProvider:
+    """用当前配置创建真实网关提供者；测试可向 Shell 注入替代工厂。"""
+
     return OpenAIChatProvider(
         api_key=config.api_key,
         base_url=config.base_url,
@@ -138,7 +155,11 @@ def _default_provider(config: AgentConfig) -> ChatProvider:
 
 
 class InteractiveShell:
-    """保持会话历史的交互式命令行外壳。"""
+    """保持会话历史的交互式命令行外壳。
+
+    ``session/messages`` 同为 ``None`` 表示下一条普通输入将创建新会话；两者有值时，
+    普通输入会继续追加到同一对话。斜杠命令只在本地处理，不会发送给模型计费。
+    """
 
     def __init__(
         self,
@@ -149,6 +170,8 @@ class InteractiveShell:
         provider_factory: Callable[[AgentConfig], ChatProvider] = _default_provider,
         approval_input: Callable[[str], str] = input,
     ) -> None:
+        """准备终端、输入历史与可替换依赖，然后组装第一套运行时组件。"""
+
         self.config = config
         self.console = console or Console()
         self.provider_factory = provider_factory
@@ -157,6 +180,7 @@ class InteractiveShell:
         self.messages: list[Message] | None = None
         self._stream_open = False
         history_dir = (config.workspace / ".localloop").resolve(strict=False)
+        # 与会话文件相同，输入历史也不能通过符号链接写到工作区之外。
         try:
             history_dir.relative_to(config.workspace)
         except ValueError as exc:
@@ -191,6 +215,12 @@ class InteractiveShell:
         self._rebuild_runtime()
 
     def _rebuild_runtime(self) -> None:
+        """按当前模型与审批配置重新组装 provider、tools、context 和 engine。
+
+        ``/model`` 或 ``/approval`` 修改的是不可变配置副本，因此需要重建依赖；会话历史
+        本身不会丢失，下一次任务会使用新设置继续。
+        """
+
         provider = self.provider_factory(self.config)
         policy = InteractiveApprovalPolicy(
             auto_approve=self.config.auto_approve,
@@ -214,6 +244,8 @@ class InteractiveShell:
         )
 
     def run(self, *, initial_resume: str | None = None) -> int:
+        """运行输入循环，直到 Ctrl-D、``/exit`` 或 ``/quit``。"""
+
         self.show_banner()
         if initial_resume and not self.resume(initial_resume):
             return 2
@@ -233,12 +265,15 @@ class InteractiveShell:
             if not line:
                 continue
             if line.startswith("/"):
+                # 本地命令不会加入模型消息，也不会写入对话历史。
                 if self.handle_command(line):
                     return 0
                 continue
             self.submit_task(line)
 
     def show_banner(self) -> None:
+        """显示启动时最重要的模型、工作区和审批状态。"""
+
         approval = "自动批准（仅限可信工作区）" if self.config.auto_approve else "每次确认"
         lines = Text()
         lines.append(f"LocalLoop v{__version__}\n", style="bold cyan")
@@ -259,6 +294,8 @@ class InteractiveShell:
         self.console.print("直接输入编程任务；输入 [cyan]/help[/cyan] 查看命令。")
 
     def submit_task(self, task: str) -> None:
+        """新建或继续会话，并把一条普通用户输入交给 AgentEngine。"""
+
         try:
             if self.session is None or self.messages is None:
                 self.session, self.messages = create_new_session(
@@ -268,6 +305,7 @@ class InteractiveShell:
                 )
                 self.console.print(f"新会话：[cyan]{self.session.session_id}[/cyan]")
             else:
+                # 后续输入直接追加为同一会话的新 user 消息，实现多轮协作。
                 message: Message = {"role": "user", "content": task}
                 self.messages.append(message)
                 self.session.append_message(message)
@@ -285,6 +323,8 @@ class InteractiveShell:
             self.console.print(result.final_output, style=error_style)
 
     def handle_command(self, line: str) -> bool:
+        """执行一个本地斜杠命令；仅退出命令返回 ``True``。"""
+
         command, _, argument = line.partition(" ")
         argument = argument.strip()
         if command in {"/exit", "/quit"}:
@@ -324,6 +364,8 @@ class InteractiveShell:
         return False
 
     def resume(self, session_id: str) -> bool:
+        """恢复指定会话并重放用户可见的历史；成功返回 ``True``。"""
+
         try:
             store, messages = resume_session(
                 workspace=self.config.workspace,
@@ -340,6 +382,8 @@ class InteractiveShell:
         return True
 
     def _show_conversation_history(self, messages: list[Message]) -> None:
+        """只重放 user/assistant 正文，隐藏系统提示词和冗长工具 JSON。"""
+
         visible = [
             (str(message.get("role")), str(message.get("content")))
             for message in messages
@@ -356,6 +400,8 @@ class InteractiveShell:
         self.console.print("── 历史结束 ──", style="dim")
 
     def _show_help(self) -> None:
+        """使用与补全菜单同一份 ``COMMANDS`` 元数据渲染帮助表。"""
+
         table = Table(title="可用命令", show_header=False, box=None)
         table.add_column(style="cyan", no_wrap=True)
         table.add_column()
@@ -364,6 +410,8 @@ class InteractiveShell:
         self.console.print(table)
 
     def _show_status(self) -> None:
+        """展示当前有效的本地运行设置。"""
+
         table = Table(title="当前状态", show_header=False)
         table.add_column(style="dim")
         table.add_column()
@@ -375,6 +423,8 @@ class InteractiveShell:
         self.console.print(table)
 
     def _show_sessions(self) -> None:
+        """按修改时间列出当前工作区最近十个会话，损坏记录只作标记。"""
+
         session_dir = self.config.workspace / ".localloop" / "sessions"
         paths = sorted(
             session_dir.glob("*.jsonl"),
@@ -400,6 +450,8 @@ class InteractiveShell:
         self.console.print(table)
 
     def _delete_session(self, session_id: str) -> None:
+        """经独立确认删除单个会话，并清除指向该会话的内存状态。"""
+
         try:
             store = SessionStore.open(self.config.workspace, session_id)
         except SessionError as exc:
@@ -423,6 +475,8 @@ class InteractiveShell:
         self.console.print(f"已删除会话 [cyan]{session_id}[/cyan]。", style="green")
 
     def _show_models(self) -> None:
+        """实时查询网关模型列表，并标出当前正在使用的模型。"""
+
         self.console.print("正在查询模型…", style="dim cyan")
         try:
             models = probe_models(
@@ -440,6 +494,8 @@ class InteractiveShell:
             self.console.print(f"  {model}{marker}")
 
     def _change_model(self, model: str) -> None:
+        """切换后续请求使用的模型，并把变更事件写入当前会话审计记录。"""
+
         if not model:
             self.console.print(f"当前模型：{self.config.model}；用法：/model 模型编号")
             return
@@ -450,6 +506,8 @@ class InteractiveShell:
         self.console.print(f"已切换模型：[bold cyan]{model}[/bold cyan]")
 
     def _change_approval(self, mode: str) -> None:
+        """在逐次确认与自动批准之间切换，并明确提示自动模式风险。"""
+
         normalized = mode.lower()
         if normalized not in {"ask", "auto"}:
             self.console.print("用法：/approval ask|auto", style="yellow")
@@ -467,12 +525,16 @@ class InteractiveShell:
             self.console.print("已恢复写入和命令逐次确认。", style="green")
 
     def _bottom_toolbar(self) -> list[tuple[str, str]]:
+        """生成每次等待输入时显示的模型、目录、审批和会话摘要。"""
+
         approval = "自动批准" if self.config.auto_approve else "逐次确认"
         session = self.session.session_id if self.session else "新会话"
         text = f" {self.config.model} · {self.config.workspace.name} · {approval} · {session} "
         return [("class:bottom-toolbar", text)]
 
     def _agent_output(self, text: str) -> None:
+        """把 AgentEngine 的离散进度事件映射成不同颜色和图标。"""
+
         if text.startswith("[模型]"):
             self.console.print("● " + text, style="dim cyan")
         elif text.startswith("[重试]"):
@@ -488,6 +550,8 @@ class InteractiveShell:
             self.console.print(Markdown(text))
 
     def _agent_stream(self, text: str) -> None:
+        """逐片显示模型正文；一轮流只打印一次开头圆点。"""
+
         if not self._stream_open:
             self.console.print()
             self.console.print("● ", style="cyan", end="")
@@ -495,11 +559,15 @@ class InteractiveShell:
         self.console.print(text, markup=False, end="", soft_wrap=True)
 
     def _agent_stream_end(self) -> None:
+        """结束已打开的流式输出行，并复位下一轮的显示状态。"""
+
         if self._stream_open:
             self.console.print()
             self._stream_open = False
 
     def _approval_output(self, text: str) -> None:
+        """为审批提示选择醒目样式，同时关闭 Rich markup 避免用户内容被解释。"""
+
         if text.startswith("[需要批准]") or text.startswith("\n[需要批准]"):
             self.console.print(text, style="bold yellow", markup=False)
         elif text == "[已自动批准]":
