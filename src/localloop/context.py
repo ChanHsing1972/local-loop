@@ -14,7 +14,7 @@ from localloop.types import Message
 
 
 class ContextBudgetError(ValueError):
-    """表示即使压缩后也无法把必要消息放入预算。"""
+    pass
 
 
 def message_chars(messages: list[Message]) -> int:
@@ -42,8 +42,6 @@ def _group_messages(messages: list[Message]) -> list[list[Message]]:
 
 
 def _compact_group(group: list[Message]) -> Message:
-    """把一组旧消息改写成包含状态、长度和短预览的确定性记录。"""
-
     first = group[0]
     if first.get("role") == "assistant" and first.get("tool_calls"):
         names = [

@@ -57,8 +57,7 @@ def test_truncated_final_event_is_ignored_for_crash_recovery(tmp_path):
 def test_unsupported_version_and_invalid_message_are_rejected(tmp_path):
     store = SessionStore.create(tmp_path, task="task", model="model")
     store.path.write_text(
-        json.dumps({"version": 99, "kind": "metadata", "data": {}, "timestamp": "x"})
-        + "\n"
+        json.dumps({"version": 99, "kind": "metadata", "data": {}, "timestamp": "x"}) + "\n"
     )
     with pytest.raises(SessionError, match="Unsupported"):
         store.load()
@@ -72,9 +71,7 @@ def test_unsupported_version_and_invalid_message_are_rejected(tmp_path):
             }
         )
         + "\n"
-        + json.dumps(
-            {"version": 1, "kind": "message", "data": {"message": []}, "timestamp": "x"}
-        )
+        + json.dumps({"version": 1, "kind": "message", "data": {"message": []}, "timestamp": "x"})
         + "\n"
     )
     with pytest.raises(SessionError, match="Invalid message"):

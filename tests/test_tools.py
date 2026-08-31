@@ -4,10 +4,9 @@ import hashlib
 import json
 
 import pytest
-from conftest import make_call
+from conftest import Approval, make_call
 
-from localloop.policy import AlwaysApprovePolicy, AlwaysDenyPolicy
-from localloop.tools import LocalTools
+from localloop.tools import InteractiveApprovalPolicy, LocalTools
 from localloop.types import ToolCall
 
 
@@ -16,7 +15,7 @@ def payload(result):
 
 
 def test_definitions_and_unknown_or_malformed_call(tmp_path):
-    tools = LocalTools(tmp_path, AlwaysApprovePolicy())
+    tools = LocalTools(tmp_path, Approval())
     assert [tool["function"]["name"] for tool in tools.definitions] == [
         "list_files",
         "read_file",
@@ -42,7 +41,7 @@ def test_list_read_create_update_and_stale_write(tmp_path):
     (tmp_path / "package.egg-info").mkdir()
     (tmp_path / ".env").write_text("secret")
     (tmp_path / ".coverage").write_text("generated")
-    tools = LocalTools(tmp_path, AlwaysApprovePolicy())
+    tools = LocalTools(tmp_path, Approval())
 
     listed = payload(tools.execute(make_call("list_files", {"path": ".", "max_depth": 2})))
     assert "src/a.py" in listed["entries"]
@@ -91,7 +90,7 @@ def test_denied_write_does_not_change_file(tmp_path):
     target = tmp_path / "a.txt"
     target.write_text("old")
     digest = hashlib.sha256(b"old").hexdigest()
-    tools = LocalTools(tmp_path, AlwaysDenyPolicy())
+    tools = LocalTools(tmp_path, Approval(False))
     result = tools.execute(
         make_call(
             "write_file",
@@ -104,7 +103,7 @@ def test_denied_write_does_not_change_file(tmp_path):
 
 @pytest.mark.parametrize("path", ["../outside", "/tmp/outside", ".env", "key.pem", ".git/config"])
 def test_blocked_paths(tmp_path, path):
-    tools = LocalTools(tmp_path, AlwaysApprovePolicy())
+    tools = LocalTools(tmp_path, Approval())
     result = tools.execute(make_call("read_file", {"path": path}))
     assert result.ok is False
 
@@ -114,18 +113,16 @@ def test_symlink_escape_and_binary_file_are_blocked(tmp_path):
     outside.write_text("outside")
     (tmp_path / "link").symlink_to(outside)
     (tmp_path / "binary").write_bytes(b"a\x00b")
-    tools = LocalTools(tmp_path, AlwaysApprovePolicy())
+    tools = LocalTools(tmp_path, Approval())
     assert tools.execute(make_call("read_file", {"path": "link"})).ok is False
     assert "Binary" in tools.execute(make_call("read_file", {"path": "binary"})).content
 
 
 def test_read_line_limits_and_invalid_arguments(tmp_path):
     (tmp_path / "many.txt").write_text("".join(f"{i}\n" for i in range(500)))
-    tools = LocalTools(tmp_path, AlwaysApprovePolicy())
+    tools = LocalTools(tmp_path, Approval())
     result = payload(
-        tools.execute(
-            make_call("read_file", {"path": "many.txt", "start_line": 2, "end_line": 3})
-        )
+        tools.execute(make_call("read_file", {"path": "many.txt", "start_line": 2, "end_line": 3}))
     )
     assert result["content"] == "1\n2\n"
     too_many = tools.execute(
@@ -140,18 +137,16 @@ def test_search_with_python_fallback(tmp_path, monkeypatch):
     (tmp_path / "a.py").write_text("alpha\nneedle here\n")
     (tmp_path / "b.txt").write_text("needle ignored by glob\n")
     monkeypatch.setattr("localloop.tools.shutil.which", lambda *args, **kwargs: None)
-    tools = LocalTools(tmp_path, AlwaysApprovePolicy())
+    tools = LocalTools(tmp_path, Approval())
     result = payload(
-        tools.execute(
-            make_call("search_text", {"query": "needle", "path": ".", "glob": "*.py"})
-        )
+        tools.execute(make_call("search_text", {"query": "needle", "path": ".", "glob": "*.py"}))
     )
     assert result["engine"] == "python"
     assert result["matches"] == ["a.py:2:needle here"]
 
 
 def test_run_command_success_failure_timeout_block_and_secret_removal(tmp_path, monkeypatch):
-    tools = LocalTools(tmp_path, AlwaysApprovePolicy())
+    tools = LocalTools(tmp_path, Approval())
     monkeypatch.setenv("LLM_API_KEY", "must-not-leak")
     success = payload(
         tools.execute(
@@ -170,9 +165,7 @@ def test_run_command_success_failure_timeout_block_and_secret_removal(tmp_path, 
     assert success["ok"] is True
     assert success["stdout"].strip() == "clean"
     failure = payload(
-        tools.execute(
-            make_call("run_command", {"args": ["python3", "-c", "raise SystemExit(3)"]})
-        )
+        tools.execute(make_call("run_command", {"args": ["python3", "-c", "raise SystemExit(3)"]}))
     )
     assert failure["exit_code"] == 3
     assert failure["ok"] is False
@@ -190,18 +183,18 @@ def test_run_command_success_failure_timeout_block_and_secret_removal(tmp_path, 
 
 
 def test_denied_and_missing_command(tmp_path):
-    denied = LocalTools(tmp_path, AlwaysDenyPolicy()).execute(
+    denied = LocalTools(tmp_path, Approval(False)).execute(
         make_call("run_command", {"args": ["python3", "--version"]})
     )
     assert denied.ok is False
-    missing = LocalTools(tmp_path, AlwaysApprovePolicy()).execute(
+    missing = LocalTools(tmp_path, Approval()).execute(
         make_call("run_command", {"args": ["definitely-not-a-command"]})
     )
     assert "not found" in missing.content
 
 
 def test_command_output_is_truncated(tmp_path):
-    tools = LocalTools(tmp_path, AlwaysApprovePolicy())
+    tools = LocalTools(tmp_path, Approval())
     result = payload(
         tools.execute(
             make_call(
@@ -230,8 +223,26 @@ def test_operating_system_error_becomes_structured_tool_result(tmp_path, monkeyp
         raise PermissionError(13, "permission denied", "/private/identity/blocked.txt")
 
     monkeypatch.setattr("pathlib.Path.read_bytes", denied)
-    tools = LocalTools(tmp_path, AlwaysApprovePolicy())
+    tools = LocalTools(tmp_path, Approval())
     result = tools.execute(make_call("read_file", {"path": "blocked.txt"}))
     assert result.ok is False
     assert "permission denied" in result.content
     assert "/private/identity" not in result.content
+
+
+def test_interactive_approval_yes_no_auto_and_eof():
+    output = []
+    yes = InteractiveApprovalPolicy(input_fn=lambda _prompt: "yes", output_fn=output.append)
+    assert yes.approve("write", "a.py", "diff") is True
+    assert "diff" in output
+    no = InteractiveApprovalPolicy(input_fn=lambda _prompt: "no", output_fn=lambda _text: None)
+    assert no.approve("write", "a.py") is False
+    auto = InteractiveApprovalPolicy(auto_approve=True, output_fn=output.append)
+    assert auto.approve("command", "pytest") is True
+
+    def eof(_prompt):
+        raise EOFError
+
+    denied = InteractiveApprovalPolicy(input_fn=eof, output_fn=output.append)
+    assert denied.approve("command", "pytest") is False
+    assert "已拒绝。" in output

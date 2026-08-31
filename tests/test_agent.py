@@ -2,11 +2,10 @@ from __future__ import annotations
 
 import hashlib
 
-from conftest import make_call
+from conftest import Approval, make_call
 
 from localloop.agent import AgentEngine, _describe_tool_result, create_new_session, resume_session
 from localloop.context import ContextManager
-from localloop.policy import AlwaysApprovePolicy
 from localloop.provider import ProviderError
 from localloop.session import SessionStore
 from localloop.tools import LocalTools
@@ -18,27 +17,29 @@ class FakeProvider:
         self.turns = list(turns)
         self.requests = []
 
-    def complete(self, messages, tools, *, tool_choice="auto"):
+    def stream(self, messages, tools, *, tool_choice="auto", on_text_delta, on_retry=None):
         self.requests.append((messages, tools, tool_choice))
         next_item = self.turns.pop(0)
         if isinstance(next_item, BaseException):
             raise next_item
+        if next_item.content:
+            on_text_delta(next_item.content)
         return next_item
 
 
-def engine(tmp_path, provider, *, max_steps=20, clock=lambda: 0.0):
+def engine(tmp_path, provider, *, max_steps=20):
     return AgentEngine(
         provider=provider,
-        tools=LocalTools(tmp_path, AlwaysApprovePolicy()),
+        tools=LocalTools(tmp_path, Approval()),
         context=ContextManager(),
+        stream_fn=lambda _text: None,
+        stream_end_fn=lambda: None,
         max_steps=max_steps,
-        max_duration_seconds=600,
         output_fn=lambda _text: None,
-        clock=clock,
     )
 
 
-def test_complete_multi_turn_run_and_resume_history(tmp_path):
+def test_multi_turn_run_and_resume_history(tmp_path):
     target = tmp_path / "bug.py"
     target.write_text("bad\n")
     digest = hashlib.sha256(b"bad\n").hexdigest()
@@ -117,7 +118,7 @@ def test_three_identical_calls_stop_before_third_execution(tmp_path):
     assert "本次未执行" in tool_messages[-1]["content"]
 
 
-def test_max_steps_empty_response_provider_error_and_timeout(tmp_path):
+def test_max_steps_empty_response_provider_error_and_timeout(tmp_path, monkeypatch):
     provider = FakeProvider(
         [
             AssistantTurn("", (make_call("list_files", {"path": ".", "max_depth": 1}),)),
@@ -128,9 +129,7 @@ def test_max_steps_empty_response_provider_error_and_timeout(tmp_path):
     maxed = engine(tmp_path, provider, max_steps=2).run(messages, store)
     assert maxed.status is RunStatus.MAX_STEPS
 
-    empty_store, empty_messages = create_new_session(
-        workspace=tmp_path, task="empty", model="fake"
-    )
+    empty_store, empty_messages = create_new_session(workspace=tmp_path, task="empty", model="fake")
     empty = engine(tmp_path, FakeProvider([AssistantTurn("", finish_reason="stop")])).run(
         empty_messages, empty_store
     )
@@ -140,15 +139,13 @@ def test_max_steps_empty_response_provider_error_and_timeout(tmp_path):
     length_store, length_messages = create_new_session(
         workspace=tmp_path, task="length", model="fake"
     )
-    length = engine(
-        tmp_path, FakeProvider([AssistantTurn("partial", finish_reason="length")])
-    ).run(length_messages, length_store)
+    length = engine(tmp_path, FakeProvider([AssistantTurn("partial", finish_reason="length")])).run(
+        length_messages, length_store
+    )
     assert length.status is RunStatus.ERROR
     assert "被截断" in length.final_output
 
-    error_store, error_messages = create_new_session(
-        workspace=tmp_path, task="error", model="fake"
-    )
+    error_store, error_messages = create_new_session(workspace=tmp_path, task="error", model="fake")
     errored = engine(tmp_path, FakeProvider([ProviderError("gateway down")])).run(
         error_messages, error_store
     )
@@ -159,9 +156,8 @@ def test_max_steps_empty_response_provider_error_and_timeout(tmp_path):
     timeout_store, timeout_messages = create_new_session(
         workspace=tmp_path, task="timeout", model="fake"
     )
-    timed = engine(
-        tmp_path, FakeProvider([]), clock=lambda: next(times)
-    ).run(timeout_messages, timeout_store)
+    monkeypatch.setattr("localloop.agent.time.monotonic", lambda: next(times))
+    timed = engine(tmp_path, FakeProvider([])).run(timeout_messages, timeout_store)
     assert timed.status is RunStatus.TIMED_OUT
 
 
@@ -246,7 +242,5 @@ def test_command_result_summary_preserves_lines_and_failure_details():
     )
     assert "stdout:\n    partial\n    stderr:\n    actual error" in both_streams
 
-    ordinary_error = _describe_tool_result(
-        "write_file", '{"ok":false,"error":"file changed"}'
-    )
+    ordinary_error = _describe_tool_result("write_file", '{"ok":false,"error":"file changed"}')
     assert ordinary_error == "write_file · file changed"

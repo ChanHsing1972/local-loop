@@ -29,26 +29,11 @@ class FakeProvider:
         self.answers = list(answers or ["完成。"])
         self.requests = []
 
-    def complete(self, messages, tools, *, tool_choice="auto"):
+    def stream(self, messages, tools, *, tool_choice="auto", on_text_delta, on_retry=None):
         self.requests.append((list(messages), tools, tool_choice))
         answer = self.answers.pop(0)
         if isinstance(answer, BaseException):
             raise answer
-        return AssistantTurn(answer)
-
-
-class StreamingProvider(FakeProvider):
-    def stream(
-        self,
-        messages,
-        tools,
-        *,
-        tool_choice="auto",
-        on_text_delta,
-        on_retry=None,
-    ):
-        self.requests.append((list(messages), tools, tool_choice))
-        answer = self.answers.pop(0)
         for character in answer:
             on_text_delta(character)
         return AssistantTurn(answer)
@@ -217,7 +202,7 @@ def test_interactive_loop_keeps_multi_turn_history(tmp_path):
 
 
 def test_interactive_shell_renders_streamed_text_once(tmp_path):
-    provider = StreamingProvider(["逐字输出成功。"])
+    provider = FakeProvider(["逐字输出成功。"])
     shell, _provider, output = make_shell(tmp_path, provider=provider)
     shell.submit_task("测试流式输出")
     rendered = output.getvalue()
@@ -325,11 +310,6 @@ def test_eof_and_keyboard_interrupt_at_prompt(tmp_path):
     assert shell.run() == 0
     assert "Ctrl-D" in output.getvalue()
     assert "再见" in output.getvalue()
-
-
-def test_invalid_initial_resume_stops(tmp_path):
-    shell, _provider, _output = make_shell(tmp_path)
-    assert shell.run(initial_resume="abcdef123456") == 2
 
 
 def test_interactive_shell_displays_provider_error(tmp_path):

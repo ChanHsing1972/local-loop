@@ -2,7 +2,7 @@
 
 Git 仓库地址：https://github.com/ChanHsing1972/local-loop
 
-LocalLoop 是一个从零实现的轻量级 coding agent，不依赖 LangChain、OpenAI Agents SDK 等 Agent 框架，也不使用服务端托管的代码执行或文件工具。程序通过 OpenAI 兼容 Chat Completions 与模型原生 tool calling 接口驱动模型，自行完成消息编排、工具执行和循环控制。
+LocalLoop 是一个只支持交互模式的轻量级 coding agent。它不依赖 Agent 框架或服务端代码执行工具，通过 OpenAI 兼容 Chat Completions、原生 tool calling 和本地 Python 代码完成消息编排、工具执行与循环控制。
 
 ## 运行方式
 
@@ -11,10 +11,14 @@ LocalLoop 是一个从零实现的轻量级 coding agent，不依赖 LangChain�
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -e .
+pip install .
 ```
 
-随后通过环境变量或 .env 配置 `LLM_API_KEY`、`LLM_BASE_URL`、`LLM_MODEL`。可先运行 `localloop doctor` 检查模型和原生工具调用，再运行 `localloop` 进入交互模式。也可使用 `localloop run "任务描述"` 执行一次性任务，`--workspace`/`-C` 指定待操作项目目录。
+通过环境变量或仓库根目录的 `.env` 配置 `LLM_API_KEY`、`LLM_BASE_URL`、`LLM_MODEL`，然后在希望 Agent 操作的项目目录运行：
+
+```bash
+localloop
+```
 
 ## 特色功能
 
@@ -45,11 +49,10 @@ pip install -e .
 
 - `agent.py`：Agent 核心执行引擎，负责模型/工具循环、工具结果回填、终止条件判断及会话创建与恢复
 - `interactive.py`：交互式终端界面，负责持续会话、流式输出、斜杠命令、模型切换与审批模式切换
-- `cli.py`：命令行程序入口，提供默认交互模式、`doctor` 环境诊断和 `run` 单任务执行模式
-- `provider.py`：模型接口适配层，负责 OpenAI 兼容 Chat Completions 请求、普通及流式响应解析、tool call 拼装、错误重试和模型列表探测
-- `tools.py`：本地工具系统，定义工具 Schema，并实现目录浏览、文件读取、全文搜索、文件写入和命令执行及相应的安全限制
+- `cli.py`：唯一程序入口，读取当前目录配置并启动交互界面
+- `provider.py`：负责流式 Chat Completions 请求、tool call 拼装、错误重试和模型列表探测
+- `tools.py`：定义五个本地工具、危险操作审批及路径、写入和命令安全限制
 - `context.py`：上下文管理器，在超过预算时对较早消息及工具交互进行确定性压缩，同时保留最近上下文
 - `session.py`：会话持久化模块，使用带版本号的仅追加 JSONL 事件记录保存消息和元数据，并支持历史会话恢复
-- `config.py`：运行配置模块，负责读取环境变量和 `.env`，校验 API 地址、模型、工作区及运行限制等配置
-- `policy.py`：操作审批策略，负责写文件和运行命令前的用户确认，并提供自动批准及测试用批准策略
-- `types.py`：公共数据结构与接口定义，包含 Agent 配置、ToolCall、ToolResult、AssistantTurn、运行状态以及 Provider、ApprovalPolicy 等协议
+- `config.py`：读取环境变量和 `.env`，校验 API 地址、模型与当前工作区
+- `types.py`：模块间共享的消息、结果和接口类型

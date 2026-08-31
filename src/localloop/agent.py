@@ -1,10 +1,4 @@
-"""LocalLoop 的核心 Agent 编排循环。
-
-本模块把模型、工具、上下文和会话存储串成一个闭环：把当前消息发给模型，若模型要求
-调用工具就本地执行并回填结果，然后再次询问模型，直到它给出最终文字或触发停止条件。
-模型接口和工具实现都通过构造参数注入，因此这里负责“流程”，不负责 HTTP 或具体文件
-操作。
-"""
+"""模型请求、工具执行和结果回填组成的 Agent 循环。"""
 
 from __future__ import annotations
 
@@ -18,7 +12,6 @@ from localloop.provider import ProviderError
 from localloop.session import SessionStore
 from localloop.tools import LocalTools
 from localloop.types import (
-    AssistantTurn,
     ChatProvider,
     Message,
     RunResult,
@@ -42,27 +35,18 @@ SYSTEM_PROMPT = """你是 LocalLoop，一个仅在指定工作区内工作的编
 
 
 class AgentEngine:
-    """驱动“模型决定下一步，工具执行下一步”的有限循环。
-
-    循环同时受最大模型调用次数、总运行时间和重复调用检测约束，防止模型无限运行。
-    ``output_fn`` 系列回调用来把进度交给不同界面；编排层本身不依赖 Rich 等 UI 库。
-    """
-
     def __init__(
         self,
         *,
         provider: ChatProvider,
         tools: LocalTools,
         context: ContextManager,
-        max_steps: int,
-        max_duration_seconds: int,
+        stream_fn: Callable[[str], None],
+        stream_end_fn: Callable[[], None],
+        max_steps: int = 20,
+        max_duration_seconds: int = 600,
         output_fn: Callable[[str], None] = print,
-        stream_fn: Callable[[str], None] | None = None,
-        stream_end_fn: Callable[[], None] | None = None,
-        clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        """保存依赖与运行上限；``clock`` 可注入假时钟以测试超时分支。"""
-
         self.provider = provider
         self.tools = tools
         self.context = context
@@ -70,23 +54,14 @@ class AgentEngine:
         self.max_duration_seconds = max_duration_seconds
         self.output_fn = output_fn
         self.stream_fn = stream_fn
-        self.stream_end_fn = stream_end_fn or (lambda: None)
-        self.clock = clock
+        self.stream_end_fn = stream_end_fn
 
     def run(self, messages: list[Message], session: SessionStore) -> RunResult:
-        """继续执行一份会话消息，直到成功、失败、中断或触及安全上限。
-
-        ``messages`` 会原地追加新消息，同时每条消息也立即写入 ``session``，使后续恢复
-        能拿到与本轮模型实际看到的一致的历史。
-        """
-
-        start = self.clock()
-        # signature 用于识别模型是否陷入“连续要求完全相同工具调用”的死循环。
+        start = time.monotonic()
         last_signature = ""
         repeated = 0
         for step in range(1, self.max_steps + 1):
-            # 在每次模型请求前检查总时限，因此已开始的单个 HTTP/工具调用仍由各自超时控制。
-            if self.clock() - start >= self.max_duration_seconds:
+            if time.monotonic() - start >= self.max_duration_seconds:
                 return self._finish(
                     session,
                     RunStatus.TIMED_OUT,
@@ -95,27 +70,44 @@ class AgentEngine:
                 )
             self.output_fn(f"[模型] 思考中（{step}）…")
             try:
-                turn = self._request_model(messages)
+                request_messages = self.context.prepare(messages)
+                try:
+                    turn = self.provider.stream(
+                        request_messages,
+                        self.tools.definitions,
+                        on_text_delta=self.stream_fn,
+                        on_retry=lambda detail: self.output_fn(f"[重试] {detail}"),
+                    )
+                finally:
+                    self.stream_end_fn()
             except (ProviderError, ContextBudgetError) as exc:
                 return self._finish(session, RunStatus.ERROR, str(exc), step - 1)
             except KeyboardInterrupt:
                 return self._finish(
                     session,
                     RunStatus.INTERRUPTED,
-                    "运行已中断；可使用 --resume " + session.session_id + " 继续",
+                    f"运行已中断；可使用 /resume {session.session_id} 继续",
                     step - 1,
                 )
 
             assistant_message = turn.as_message()
-            # 先保存 assistant 的工具请求，再执行工具，历史顺序才符合 API 协议。
             messages.append(assistant_message)
             session.append_message(assistant_message)
-            if turn.usage:
-                session.append("usage", {"step": step, "usage": turn.usage})
 
             if not turn.tool_calls:
-                # 没有工具调用表示模型认为本轮可以直接结束并答复用户。
-                return self._finish_text_turn(turn, session, step)
+                if turn.finish_reason == "length":
+                    return self._finish(
+                        session, RunStatus.ERROR, "模型输出在任务完成前被截断。", step
+                    )
+                if turn.content.strip():
+                    return self._finish(session, RunStatus.COMPLETED, turn.content.strip(), step)
+                reason = f" (finish_reason={turn.finish_reason})" if turn.finish_reason else ""
+                return self._finish(
+                    session,
+                    RunStatus.ERROR,
+                    "模型既未返回文本，也未返回工具调用" + reason,
+                    step,
+                )
 
             signature = _tool_call_signature(turn.tool_calls)
             if signature == last_signature:
@@ -124,7 +116,6 @@ class AgentEngine:
                 last_signature = signature
                 repeated = 1
             if repeated >= 3:
-                # 第三次不再真正执行，既避免重复副作用，也给每个 call_id 补齐失败结果。
                 _append_failed_tool_results(
                     messages,
                     session,
@@ -142,7 +133,7 @@ class AgentEngine:
                 return self._finish(
                     session,
                     RunStatus.INTERRUPTED,
-                    "运行已中断；可使用 --resume " + session.session_id + " 继续",
+                    f"运行已中断；可使用 /resume {session.session_id} 继续",
                     step,
                 )
 
@@ -153,65 +144,18 @@ class AgentEngine:
             self.max_steps,
         )
 
-    def _request_model(self, messages: list[Message]) -> AssistantTurn:
-        """压缩请求上下文，并在提供者支持时选择流式输出。"""
-
-        request_messages = self.context.prepare(messages)
-        # Protocol 只承诺 complete；getattr 让测试提供者或其他简单网关无需实现 stream。
-        stream_method = getattr(self.provider, "stream", None)
-        if self.stream_fn is None or not callable(stream_method):
-            return self.provider.complete(request_messages, self.tools.definitions)
-        try:
-            return stream_method(
-                request_messages,
-                self.tools.definitions,
-                on_text_delta=self.stream_fn,
-                on_retry=lambda detail: self.output_fn(f"[重试] {detail}"),
-            )
-        finally:
-            # 即使流式解析抛错，也通知界面结束当前输出行，避免后续状态粘在正文后面。
-            self.stream_end_fn()
-
-    def _finish_text_turn(
-        self,
-        turn: AssistantTurn,
-        session: SessionStore,
-        step: int,
-    ) -> RunResult:
-        """处理“不再调用工具”的模型响应，并判断它是否真的是有效最终答案。"""
-
-        if turn.finish_reason == "length":
-            return self._finish(session, RunStatus.ERROR, "模型输出在任务完成前被截断。", step)
-        if turn.content.strip():
-            if self.stream_fn is None or not callable(getattr(self.provider, "stream", None)):
-                self.output_fn(turn.content)
-            return self._finish(session, RunStatus.COMPLETED, turn.content.strip(), step)
-        reason = f" (finish_reason={turn.finish_reason})" if turn.finish_reason else ""
-        return self._finish(
-            session,
-            RunStatus.ERROR,
-            "模型既未返回文本，也未返回工具调用" + reason,
-            step,
-        )
-
     def _execute_tools(
         self,
         calls: tuple[ToolCall, ...],
         messages: list[Message],
         session: SessionStore,
     ) -> bool:
-        """按模型给出的顺序执行一批工具，并把每个结果立即写回历史。
-
-        返回 ``False`` 只表示用户用 Ctrl-C 中断；普通工具失败仍会作为结构化结果交回
-        模型，让模型有机会诊断并改用其他参数。
-        """
-
         for index, call in enumerate(calls):
             self.output_fn(f"[工具] {_describe_tool_call(call.name, call.arguments)}")
             try:
                 result = self.tools.execute(call)
             except KeyboardInterrupt:
-                # API 要求每个工具调用都有对应结果，所以为当前及剩余调用补失败消息。
+                # 每个 tool_call_id 都必须有结果，否则后续请求不符合模型协议。
                 _append_failed_tool_results(
                     messages,
                     session,
@@ -233,20 +177,11 @@ class AgentEngine:
         output: str,
         steps: int,
     ) -> RunResult:
-        """统一记录终止事件并构造给界面使用的运行结果。"""
-
         session.append("terminal", {"status": status.value, "output": output, "steps": steps})
-        return RunResult(
-            status=status,
-            final_output=output,
-            session_id=session.session_id,
-            steps=steps,
-        )
+        return RunResult(status=status, final_output=output, steps=steps)
 
 
 def _describe_tool_call(name: str, raw_arguments: str) -> str:
-    """把工具 JSON 参数变成适合终端实时展示的一句话，而不改变原始记录。"""
-
     try:
         arguments = json.loads(raw_arguments)
     except (json.JSONDecodeError, TypeError):
@@ -277,8 +212,6 @@ def _describe_tool_call(name: str, raw_arguments: str) -> str:
 
 
 def _describe_tool_result(name: str, raw_content: str) -> str:
-    """从结构化工具结果中提取状态、数量和有限长度的输出预览。"""
-
     try:
         payload = json.loads(raw_content)
     except (json.JSONDecodeError, TypeError):
@@ -292,7 +225,9 @@ def _describe_tool_result(name: str, raw_content: str) -> str:
         output = str(payload.get("output", "")).strip()
         if output:
             detail += "\n" + output
-        return _error_result_summary(name, detail)
+        preview = detail[:600] + ("\n…" if len(detail) > 600 else "")
+        first, *rest = preview.splitlines() or [""]
+        return f"{name} · {first}" + "".join(f"\n    {line}" for line in rest)
     if name == "read_file":
         return (
             f"已读取 {payload.get('path', '?')} 第 {payload.get('start_line', '?')}-"
@@ -311,38 +246,16 @@ def _describe_tool_result(name: str, raw_content: str) -> str:
 
 
 def _command_result_summary(payload: dict) -> str:
-    """保留命令退出码及 stdout/stderr 的换行结构，便于用户判断真实结果。"""
-
     stdout = str(payload.get("stdout") or "").strip()
     stderr = str(payload.get("stderr") or "").strip()
     output = f"stdout:\n{stdout}\nstderr:\n{stderr}" if stdout and stderr else stdout or stderr
-    suffix = f"；输出：\n{_indented_preview(output)}" if output else ""
+    preview = output[:600] + ("\n…" if len(output) > 600 else "")
+    indented = "\n".join(f"    {line}" for line in preview.splitlines())
+    suffix = f"；输出：\n{indented}" if output else ""
     return f"退出码 {payload.get('exit_code', '?')}{suffix}"
 
 
-def _error_result_summary(name: str, detail: str) -> str:
-    """限制错误预览长度，并缩进后续行以保持终端层次清楚。"""
-
-    preview = detail[:600]
-    if len(detail) > 600:
-        preview += "\n…"
-    first, *rest = preview.splitlines() or [""]
-    suffix = "".join(f"\n    {line}" for line in rest)
-    return f"{name} · {first}{suffix}"
-
-
-def _indented_preview(text: str, limit: int = 600) -> str:
-    """生成带缩进的有限长度预览；完整内容仍保存在会话工具消息中。"""
-
-    preview = text[:limit]
-    if len(text) > limit:
-        preview += "\n…"
-    return "\n".join(f"    {line}" for line in preview.splitlines())
-
-
 def _tool_call_signature(calls: Iterable[ToolCall]) -> str:
-    """稳定序列化一批调用，用于比较语义相同但 JSON 键顺序不同的请求。"""
-
     normalized = []
     for call in calls:
         try:
@@ -364,8 +277,6 @@ def _append_failed_tool_results(
     calls: Iterable[ToolCall],
     error: str,
 ) -> None:
-    """为未执行的调用补齐失败 tool 消息，保持对话协议完整且可恢复。"""
-
     for call in calls:
         message = ToolResult(
             tool_call_id=call.id,
@@ -378,8 +289,6 @@ def _append_failed_tool_results(
 
 
 def create_new_session(*, workspace, task: str, model: str) -> tuple[SessionStore, list[Message]]:
-    """创建会话文件，并以系统提示词和首个用户任务初始化消息历史。"""
-
     clean_task = task.strip()
     if not clean_task:
         raise ValueError("任务不能为空")
@@ -394,8 +303,6 @@ def create_new_session(*, workspace, task: str, model: str) -> tuple[SessionStor
 
 
 def resume_session(*, workspace, session_id: str) -> tuple[SessionStore, list[Message]]:
-    """从磁盘恢复历史，并修补上次意外退出可能留下的不完整工具调用。"""
-
     store = SessionStore.open(workspace, session_id)
     data = store.load()
     if len(data.messages) < 2:
@@ -413,7 +320,6 @@ def _repair_trailing_tool_calls(store: SessionStore, messages: list[Message]) ->
     """
 
     assistant_index: int | None = None
-    # 只检查历史尾部最近的一组工具协议；更早的组在写入时已经固定下来。
     for index in range(len(messages) - 1, -1, -1):
         message = messages[index]
         if message.get("role") == "assistant" and message.get("tool_calls"):

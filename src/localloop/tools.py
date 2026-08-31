@@ -1,10 +1,4 @@
-"""定义并执行模型可调用的五个本地工具。
-
-模型只能提出结构化的函数调用，真正的文件和进程操作全部在这里完成。所有路径必须位于
-指定工作区，敏感文件会被拒绝；写入前展示差异并校验最近读取的 SHA-256；命令以参数
-数组直接执行而不经过 shell，并使用清理过的环境变量。它们是降低误操作风险的多层防线，
-但不是操作系统级沙箱，自动批准模式下仍应只在可信、可恢复的工作区使用。
-"""
+"""模型可调用的本地工具及危险操作审批。"""
 
 from __future__ import annotations
 
@@ -18,12 +12,11 @@ import shutil
 import stat
 import subprocess
 import tempfile
-from dataclasses import dataclass
+from collections.abc import Callable
 from pathlib import Path
 
 from localloop.types import ApprovalPolicy, JsonObject, ToolCall, ToolResult
 
-# 对文件、搜索结果和命令输出设置上限，避免一次工具调用挤满模型上下文或本地内存。
 MAX_FILE_BYTES = 1_048_576
 MAX_COMMAND_OUTPUT_CHARS = 20_000
 MAX_SEARCH_RESULTS = 200
@@ -62,38 +55,42 @@ IGNORED_FILES = {".coverage", ".DS_Store"}
 
 
 class ToolError(RuntimeError):
-    """表示可预期、可作为结构化结果返回给模型的工具错误。"""
+    pass
 
 
-@dataclass(frozen=True, slots=True)
-class ToolDefinition:
-    """一个工具的名称、说明及 JSON Schema 参数约束。"""
+class InteractiveApprovalPolicy:
+    """写文件和运行命令前默认询问，空输入或中断均视为拒绝。"""
 
-    name: str
-    description: str
-    parameters: JsonObject
+    def __init__(
+        self,
+        *,
+        auto_approve: bool = False,
+        input_fn: Callable[[str], str] = input,
+        output_fn: Callable[[str], None] = print,
+    ) -> None:
+        self.auto_approve = auto_approve
+        self.input_fn = input_fn
+        self.output_fn = output_fn
 
-    def as_api_tool(self) -> JsonObject:
-        """转换为 OpenAI 原生 function tool 所需的外层结构。"""
-
-        return {
-            "type": "function",
-            "function": {
-                "name": self.name,
-                "description": self.description,
-                "parameters": self.parameters,
-            },
-        }
+    def approve(self, action: str, details: str, preview: str = "") -> bool:
+        self.output_fn(f"\n[需要批准] {action}：{details}")
+        if preview:
+            self.output_fn(preview)
+        if self.auto_approve:
+            self.output_fn("[已自动批准]")
+            return True
+        try:
+            return self.input_fn("是否批准？[y/N] ").strip().lower() in {"y", "yes", "是"}
+        except (EOFError, KeyboardInterrupt):
+            self.output_fn("已拒绝。")
+            return False
 
 
 def _safe_environment() -> dict[str, str]:
-    """为子进程构造最小环境，主动排除看起来像密钥或口令的变量。"""
-
     allowed_exact = {"PATH", "LANG", "LC_ALL", "TERM", "TMPDIR", "PYTHONPATH", "VIRTUAL_ENV"}
     result: dict[str, str] = {}
     for name, value in os.environ.items():
         upper = name.upper()
-        # 即使变量也在允许名单中，只要名字像秘密就优先排除。
         if any(marker in upper for marker in SECRET_ENV_MARKERS):
             continue
         if name in allowed_exact or name.startswith("LC_"):
@@ -114,14 +111,10 @@ def _truncate(text: str, limit: int) -> tuple[str, bool]:
 
 
 class LocalTools:
-    """工作区绑定的工具注册表与安全执行器。"""
-
     def __init__(self, workspace: Path, policy: ApprovalPolicy) -> None:
-        """固定工作区和审批策略，并建立“模型工具名 -> Python 方法”映射。"""
-
         self.workspace = workspace.resolve()
         self.policy = policy
-        self._definitions = self._build_definitions()
+        self.definitions = TOOL_DEFINITIONS
         self._handlers = {
             "list_files": self.list_files,
             "read_file": self.read_file,
@@ -130,19 +123,7 @@ class LocalTools:
             "run_command": self.run_command,
         }
 
-    @property
-    def definitions(self) -> list[JsonObject]:
-        """返回发给模型的五个工具定义；每次返回新列表，避免外部修改内部元数据。"""
-
-        return [definition.as_api_tool() for definition in self._definitions]
-
     def execute(self, call: ToolCall) -> ToolResult:
-        """解析模型参数并分派工具，保证所有可预期异常都变成 ``ToolResult``。
-
-        工具失败不直接抛到 Agent 主循环，而是作为 ``ok=false`` 回填给模型，模型随后可以
-        读取现状、修正参数或向用户解释阻碍。
-        """
-
         handler = self._handlers.get(call.name)
         if handler is None:
             return self._error_result(call, f"Unknown tool: {call.name}")
@@ -208,8 +189,6 @@ class LocalTools:
 
     @staticmethod
     def _read_text(path: Path) -> tuple[bytes, str]:
-        """只读取大小受限的普通 UTF-8 文本，并同时返回原始字节用于计算哈希。"""
-
         if not path.is_file():
             raise ToolError(f"Not a regular file: {path.name}")
         size = path.stat().st_size
@@ -224,8 +203,6 @@ class LocalTools:
             raise ToolError("File is not valid UTF-8 text") from exc
 
     def list_files(self, path: str = ".", max_depth: int = 3) -> JsonObject:
-        """列出目录树，跳过依赖、缓存、会话和敏感配置，最多返回 500 项。"""
-
         if not isinstance(max_depth, int) or not 0 <= max_depth <= 8:
             raise ToolError("max_depth must be an integer between 0 and 8")
         root = self._validate_path(path, must_exist=True)
@@ -266,8 +243,6 @@ class LocalTools:
         start_line: int = 1,
         end_line: int | None = None,
     ) -> JsonObject:
-        """读取至多 400 行文本，并返回整个文件的 SHA-256 供安全写回。"""
-
         if not isinstance(start_line, int) or start_line < 1:
             raise ToolError("start_line must be a positive integer")
         if end_line is None:
@@ -279,7 +254,6 @@ class LocalTools:
         resolved = self._validate_path(path, must_exist=True)
         raw, text = self._read_text(resolved)
         lines = text.splitlines(keepends=True)
-        # 用户使用从 1 开始的行号，Python 切片使用从 0 开始且右端不包含。
         selected = "".join(lines[start_line - 1 : end_line])
         return {
             "ok": True,
@@ -293,8 +267,6 @@ class LocalTools:
         }
 
     def search_text(self, query: str, path: str = ".", glob: str | None = None) -> JsonObject:
-        """在工作区内做字面文本搜索，优先使用 ripgrep，缺失时退回纯 Python。"""
-
         if not isinstance(query, str) or not query:
             raise ToolError("query must be a non-empty string")
         if len(query) > 500:
@@ -343,8 +315,6 @@ class LocalTools:
         return self._python_search(query=query, root=root, glob=glob)
 
     def _python_search(self, *, query: str, root: Path, glob: str | None) -> JsonObject:
-        """没有安装 ripgrep 时使用的功能等价后备搜索器。"""
-
         matches: list[str] = []
         for current, directories, filenames in os.walk(root, followlinks=False):
             directories[:] = [
@@ -512,88 +482,78 @@ class LocalTools:
             "truncated": stdout_truncated or stderr_truncated,
         }
 
-    @staticmethod
-    def _build_definitions() -> tuple[ToolDefinition, ...]:
-        """集中声明模型可见的工具协议；没有登记在这里的方法不会暴露给模型。"""
 
-        return (
-            ToolDefinition(
-                "list_files",
-                (
-                    "List files under a workspace-relative directory. "
-                    "Sensitive directories are omitted."
-                ),
-                {
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string", "default": "."},
-                        "max_depth": {"type": "integer", "minimum": 0, "maximum": 8},
-                    },
-                    "additionalProperties": False,
-                },
-            ),
-            ToolDefinition(
-                "read_file",
-                "Read up to 400 lines of a UTF-8 file and return its SHA-256 for safe updates.",
-                {
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string"},
-                        "start_line": {"type": "integer", "minimum": 1},
-                        "end_line": {"type": "integer", "minimum": 1},
-                    },
-                    "required": ["path"],
-                    "additionalProperties": False,
-                },
-            ),
-            ToolDefinition(
-                "search_text",
-                "Search literal text in workspace files using ripgrep with a Python fallback.",
-                {
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string"},
-                        "path": {"type": "string", "default": "."},
-                        "glob": {"type": "string"},
-                    },
-                    "required": ["query"],
-                    "additionalProperties": False,
-                },
-            ),
-            ToolDefinition(
-                "write_file",
-                (
-                    "Create or atomically replace a UTF-8 file. "
-                    "Existing files require the last read SHA-256."
-                ),
-                {
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string"},
-                        "content": {"type": "string"},
-                        "expected_sha256": {"type": "string"},
-                    },
-                    "required": ["path", "content"],
-                    "additionalProperties": False,
-                },
-            ),
-            ToolDefinition(
-                "run_command",
-                "Run an argv array without a shell, with a sanitized environment and timeout.",
-                {
-                    "type": "object",
-                    "properties": {
-                        "args": {"type": "array", "items": {"type": "string"}, "minItems": 1},
-                        "cwd": {"type": "string", "default": "."},
-                        "timeout_seconds": {
-                            "type": "integer",
-                            "minimum": 1,
-                            "maximum": 120,
-                            "default": 30,
-                        },
-                    },
-                    "required": ["args"],
-                    "additionalProperties": False,
-                },
-            ),
-        )
+def _tool_schema(
+    name: str,
+    description: str,
+    properties: JsonObject,
+    required: tuple[str, ...] = (),
+) -> JsonObject:
+    parameters: JsonObject = {
+        "type": "object",
+        "properties": properties,
+        "additionalProperties": False,
+    }
+    if required:
+        parameters["required"] = list(required)
+    return {
+        "type": "function",
+        "function": {"name": name, "description": description, "parameters": parameters},
+    }
+
+
+TOOL_DEFINITIONS = [
+    _tool_schema(
+        "list_files",
+        "List files under a workspace-relative directory.",
+        {
+            "path": {"type": "string", "default": "."},
+            "max_depth": {"type": "integer", "minimum": 0, "maximum": 8},
+        },
+    ),
+    _tool_schema(
+        "read_file",
+        "Read up to 400 UTF-8 lines and return the file SHA-256.",
+        {
+            "path": {"type": "string"},
+            "start_line": {"type": "integer", "minimum": 1},
+            "end_line": {"type": "integer", "minimum": 1},
+        },
+        ("path",),
+    ),
+    _tool_schema(
+        "search_text",
+        "Search literal text in workspace files.",
+        {
+            "query": {"type": "string"},
+            "path": {"type": "string", "default": "."},
+            "glob": {"type": "string"},
+        },
+        ("query",),
+    ),
+    _tool_schema(
+        "write_file",
+        "Create or atomically replace a UTF-8 file after approval.",
+        {
+            "path": {"type": "string"},
+            "content": {"type": "string"},
+            "expected_sha256": {"type": "string"},
+        },
+        ("path", "content"),
+    ),
+    _tool_schema(
+        "run_command",
+        "Run an argv array without a shell, with approval and timeout.",
+        {
+            "args": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+            "cwd": {"type": "string", "default": "."},
+            "timeout_seconds": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 120,
+                "default": 30,
+            },
+        },
+        ("args",),
+    ),
+]

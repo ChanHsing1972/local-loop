@@ -1,9 +1,4 @@
-"""连接 OpenAI 兼容 Chat Completions 网关并规范化响应。
-
-这个“提供者层”只处理 HTTP 客户端、重试、流式分片和协议解析；它不知道工作区，也不
-执行工具。``AgentEngine`` 只接收本模块产出的 ``AssistantTurn``，从而把不稳定的外部
-响应隔离在一个地方。项目允许使用 OpenAI 客户端库，但 Agent 循环仍由本地代码实现。
-"""
+"""OpenAI 兼容网关的流式请求、重试与响应解析。"""
 
 from __future__ import annotations
 
@@ -28,23 +23,19 @@ from localloop.types import AssistantTurn, JsonObject, Message, ToolCall
 
 
 class ProviderError(RuntimeError):
-    """经过脱敏、可直接展示给用户的模型接口错误。"""
+    pass
 
 
 class _RetryableResponseError(ValueError):
-    """HTTP 成功但响应暂时不可用，可以安全重试。"""
+    pass
 
 
 def _safe_error(error: BaseException, api_key: str) -> str:
-    """生成可展示的有限长度错误文本，并把当前 API 密钥替换为脱敏标记。"""
-
     text = str(error).replace(api_key, "[REDACTED]")
     return text[:1_000]
 
 
 class OpenAIChatProvider:
-    """OpenAI 兼容网关适配器；所有 Agent 编排逻辑均由 ``AgentEngine`` 实现。"""
-
     def __init__(
         self,
         *,
@@ -56,12 +47,6 @@ class OpenAIChatProvider:
         sleeper: Callable[[float], None] = time.sleep,
         client: Any | None = None,
     ) -> None:
-        """创建提供者。
-
-        SDK 自带重试被设为 0，统一由本类控制重试次数和可观察提示，避免两层重试叠加。
-        ``client`` 和 ``sleeper`` 可注入替身，使单元测试不访问真实网络也无需真的等待。
-        """
-
         self.api_key = api_key
         self.model = model
         self.max_retries = max_retries
@@ -73,17 +58,6 @@ class OpenAIChatProvider:
             max_retries=0,
         )
 
-    def complete(
-        self,
-        messages: list[Message],
-        tools: list[JsonObject],
-        *,
-        tool_choice: str | JsonObject = "auto",
-    ) -> AssistantTurn:
-        """发起普通非流式请求，返回标准化的一轮模型输出。"""
-
-        return self._request(messages, tools, tool_choice=tool_choice)
-
     def stream(
         self,
         messages: list[Message],
@@ -94,49 +68,17 @@ class OpenAIChatProvider:
         on_retry: Callable[[str], None] | None = None,
     ) -> AssistantTurn:
         """流式返回正文，同时在本地拼装完整文本和原生工具调用。"""
-
-        return self._request(
-            messages,
-            tools,
-            tool_choice=tool_choice,
-            on_text_delta=on_text_delta,
-            on_retry=on_retry,
-        )
-
-    def _request(
-        self,
-        messages: list[Message],
-        tools: list[JsonObject],
-        *,
-        tool_choice: str | JsonObject,
-        on_text_delta: Callable[[str], None] | None = None,
-        on_retry: Callable[[str], None] | None = None,
-    ) -> AssistantTurn:
-        """执行带有限指数退避的请求，并把底层异常转换成安全的 ``ProviderError``。
-
-        认证、权限和参数错误重试也不会自行恢复，因此立即失败；连接错误、超时、限流、
-        408/409、5xx 及空响应可以短暂重试。已经开始消费流后不再重试，以免向终端重复
-        输出文本，或让一次模型决定被误执行两遍。
-        """
-
-        streaming = on_text_delta is not None
         for attempt in range(self.max_retries + 1):
-            # 用可变单元素列表让 _parse_stream 能向本层回报“已经看到 choice”。
             stream_state = [False]
             try:
-                request: dict[str, Any] = {
-                    "model": self.model,
-                    "messages": messages,
-                    "tools": tools,
-                    "tool_choice": tool_choice,
-                }
-                if streaming:
-                    request["stream"] = True
-                # 工具定义随每次请求发送；真正是否执行仍由本地 AgentEngine 决定。
-                response = self.client.chat.completions.create(**request)
-                if streaming:
-                    return self._parse_stream(response, on_text_delta, stream_state=stream_state)
-                return self._parse_response(response)
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    stream=True,
+                )
+                return self._parse_stream(response, on_text_delta, stream_state)
             except (AuthenticationError, PermissionDeniedError, BadRequestError) as exc:
                 raise ProviderError(_safe_error(exc, self.api_key)) from exc
             except RateLimitError as exc:
@@ -166,7 +108,7 @@ class OpenAIChatProvider:
                 if attempt >= self.max_retries:
                     raise ProviderError(
                         f"网关连续 {attempt + 1} 次返回空响应；"
-                        "请运行 localloop doctor 检查网关，或使用 /model 切换模型"
+                        "请检查网关配置，或使用 /model 切换模型"
                     ) from exc
             except (AttributeError, TypeError, ValueError) as exc:
                 raise ProviderError(
@@ -179,114 +121,22 @@ class OpenAIChatProvider:
         raise AssertionError("retry loop exhausted")  # pragma: no cover
 
     @staticmethod
-    def _parse_response(response: Any) -> AssistantTurn:
-        """兼容 SDK 对象、字典及少数网关直接返回的字符串，并严格检查工具调用。"""
-
-        if isinstance(response, str):
-            text = response.strip()
-            if not text:
-                raise _RetryableResponseError("响应是空字符串")
-            try:
-                decoded = json.loads(text)
-            except json.JSONDecodeError:
-                return AssistantTurn(content=text, finish_reason="stop")
-            if isinstance(decoded, str):
-                return AssistantTurn(content=decoded, finish_reason="stop")
-            response = decoded
-
-        if isinstance(response, Mapping):
-            OpenAIChatProvider._raise_payload_error(response)
-            choices = response.get("choices")
-        else:
-            choices = getattr(response, "choices", None)
-        if not choices:
-            raise _RetryableResponseError("响应中没有 choices")
-        choice = choices[0]
-        message = OpenAIChatProvider._field(choice, "message")
-        if message is None:
-            raise _RetryableResponseError("choice 中没有 message")
-        calls: list[ToolCall] = []
-        call_ids: set[str] = set()
-        for call in OpenAIChatProvider._field(message, "tool_calls", []) or []:
-            call_type = OpenAIChatProvider._field(call, "type", "function")
-            if call_type != "function":
-                raise ValueError(f"不支持的工具调用类型：{call_type}")
-            call_id = OpenAIChatProvider._field(call, "id")
-            if not isinstance(call_id, str) or not call_id.strip():
-                raise ValueError("工具调用缺少有效的调用编号")
-            # 重复 id 会使后续 tool 结果无法唯一对应调用，因此不能勉强接受。
-            if call_id in call_ids:
-                raise ValueError(f"工具调用编号重复：{call_id}")
-            call_ids.add(call_id)
-            function = OpenAIChatProvider._field(call, "function")
-            if function is None:
-                raise ValueError("工具调用中没有 function")
-            name = OpenAIChatProvider._field(function, "name")
-            arguments = OpenAIChatProvider._field(function, "arguments")
-            if not isinstance(name, str) or not name.strip():
-                raise ValueError("工具调用缺少有效的函数名称")
-            if not isinstance(arguments, str):
-                raise ValueError(f"工具 {name} 的参数不是 JSON 字符串")
-            calls.append(
-                ToolCall(
-                    id=call_id,
-                    name=name,
-                    arguments=arguments,
-                )
-            )
-        usage = None
-        raw_usage = OpenAIChatProvider._field(response, "usage")
-        if raw_usage is not None:
-            usage = (
-                raw_usage.model_dump(exclude_none=True)
-                if hasattr(raw_usage, "model_dump")
-                else dict(raw_usage)
-            )
-        raw_content = OpenAIChatProvider._field(message, "content", "")
-        content = raw_content if isinstance(raw_content, str) else ""
-        turn = AssistantTurn(
-            content=content,
-            tool_calls=tuple(calls),
-            finish_reason=OpenAIChatProvider._field(choice, "finish_reason"),
-            usage=usage,
-        )
-        if not turn.content.strip() and not turn.tool_calls:
-            raise _RetryableResponseError("message 中没有文本或工具调用")
-        return turn
-
-    @staticmethod
     def _parse_stream(
         response: Any,
         on_text_delta: Callable[[str], None],
-        *,
-        stream_state: list[bool] | None = None,
+        stream_state: list[bool],
     ) -> AssistantTurn:
-        """逐块转发正文，同时按 ``index`` 拼合被拆碎的工具调用参数。
-
-        流式协议可能把一个函数名或 JSON 参数拆到多个 chunk。``calls`` 以调用序号为键，
-        把对应片段依次连接；直到流结束才构造不可变的 ``ToolCall``。
-        """
-
         content_parts: list[str] = []
         calls: dict[int, dict[str, str]] = {}
         finish_reason: str | None = None
-        usage: JsonObject | None = None
         try:
             for chunk in response:
                 if isinstance(chunk, Mapping):
                     OpenAIChatProvider._raise_payload_error(chunk)
-                raw_usage = OpenAIChatProvider._field(chunk, "usage")
-                if raw_usage is not None:
-                    usage = (
-                        raw_usage.model_dump(exclude_none=True)
-                        if hasattr(raw_usage, "model_dump")
-                        else dict(raw_usage)
-                    )
                 choices = OpenAIChatProvider._field(chunk, "choices", []) or []
                 for choice in choices:
-                    if stream_state is not None:
-                        # 外层据此避免对已经开始的响应再发一次请求。
-                        stream_state[0] = True
+                    # 已经收到输出后不再自动重试，以免重复显示或执行工具。
+                    stream_state[0] = True
                     reason = OpenAIChatProvider._field(choice, "finish_reason")
                     if reason:
                         finish_reason = str(reason)
@@ -316,7 +166,6 @@ class OpenAIChatProvider:
                             if isinstance(arguments, str) and arguments:
                                 aggregate["arguments"] += arguments
         finally:
-            # 无论成功还是解析失败，都尽快释放底层 HTTP 流连接。
             close = getattr(response, "close", None)
             if callable(close):
                 close()
@@ -324,14 +173,17 @@ class OpenAIChatProvider:
             ToolCall(id=item["id"], name=item["name"], arguments=item["arguments"])
             for _, item in sorted(calls.items())
         )
+        call_ids: set[str] = set()
         for call in tool_calls:
             if not call.id or not call.name:
                 raise ValueError("流式工具调用缺少编号或名称")
+            if call.id in call_ids:
+                raise ValueError(f"工具调用编号重复：{call.id}")
+            call_ids.add(call.id)
         turn = AssistantTurn(
             content="".join(content_parts),
             tool_calls=tool_calls,
             finish_reason=finish_reason,
-            usage=usage,
         )
         if not turn.content.strip() and not turn.tool_calls:
             raise _RetryableResponseError("流中没有文本或工具调用")
@@ -339,16 +191,12 @@ class OpenAIChatProvider:
 
     @staticmethod
     def _field(value: Any, name: str, default: Any = None) -> Any:
-        """统一读取字典响应和 OpenAI SDK 属性对象中的同名字段。"""
-
         if isinstance(value, Mapping):
             return value.get(name, default)
         return getattr(value, name, default)
 
     @staticmethod
     def _raise_payload_error(payload: Mapping[str, Any]) -> None:
-        """识别 HTTP 200 内嵌的标准 error 或某些网关的业务错误码。"""
-
         if "error" in payload:
             error = payload["error"]
             detail = error.get("message", error) if isinstance(error, Mapping) else error
@@ -371,11 +219,7 @@ def probe_models(
     sleeper: Callable[[float], None] = time.sleep,
     client: Any | None = None,
 ) -> list[str]:
-    """探测兼容 OpenAI 的模型列表接口，并识别被包装的业务错误。
-
-    这里使用独立的轻量 HTTP 请求，因为只需要读取 ``GET /models``，无需创建聊天客户端。
-    响应体最多读取 2 MB，错误正文最多展示 500 字符，防止异常网关塞入过量内容。
-    """
+    """读取兼容 OpenAI 的模型列表，供交互命令 `/models` 使用。"""
 
     owns_client = client is None
     http_client = client or httpx.Client(timeout=timeout)
@@ -397,7 +241,7 @@ def probe_models(
                 sleeper(min(2**attempt, 8))
                 continue
             status = int(response.status_code)
-            # 对成功和错误响应都设置读取上限，避免诊断命令占用无界内存。
+            # 限制异常网关响应，避免模型列表请求占用无界内存。
             raw = bytes(response.content[:2_000_000])
             if (status in {408, 409, 429} or status >= 500) and attempt < max_retries:
                 sleeper(min(2**attempt, 8))

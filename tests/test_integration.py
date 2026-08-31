@@ -4,11 +4,10 @@ import hashlib
 import subprocess
 import sys
 
-from conftest import make_call
+from conftest import Approval, make_call
 
 from localloop.agent import AgentEngine, create_new_session
 from localloop.context import ContextManager
-from localloop.policy import AlwaysApprovePolicy
 from localloop.tools import LocalTools
 from localloop.types import AssistantTurn, RunStatus
 
@@ -18,9 +17,12 @@ class ScriptedProvider:
         self.turns = list(turns)
         self.requests = []
 
-    def complete(self, messages, tools, *, tool_choice="auto"):
+    def stream(self, messages, tools, *, tool_choice="auto", on_text_delta, on_retry=None):
         self.requests.append(list(messages))
-        return self.turns.pop(0)
+        turn = self.turns.pop(0)
+        if turn.content:
+            on_text_delta(turn.content)
+        return turn
 
 
 def test_agent_repairs_bug_and_runs_real_tests_in_temporary_git_repo(tmp_path):
@@ -80,8 +82,10 @@ def test_agent_repairs_bug_and_runs_real_tests_in_temporary_git_repo(tmp_path):
     )
     engine = AgentEngine(
         provider=provider,
-        tools=LocalTools(tmp_path, AlwaysApprovePolicy()),
+        tools=LocalTools(tmp_path, Approval()),
         context=ContextManager(),
+        stream_fn=lambda _text: None,
+        stream_end_fn=lambda: None,
         max_steps=10,
         max_duration_seconds=120,
         output_fn=lambda _text: None,
@@ -92,9 +96,7 @@ def test_agent_repairs_bug_and_runs_real_tests_in_temporary_git_repo(tmp_path):
     assert result.status is RunStatus.COMPLETED
     assert result.steps == 5
     assert "left + right" in source.read_text(encoding="utf-8")
-    test_result = next(
-        message for message in messages if message.get("tool_call_id") == "test"
-    )
+    test_result = next(message for message in messages if message.get("tool_call_id") == "test")
     assert '"exit_code":0' in test_result["content"]
     assert "1 passed" in test_result["content"]
     assert [request[-1]["role"] for request in provider.requests] == [
