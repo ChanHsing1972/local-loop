@@ -1,17 +1,21 @@
 from __future__ import annotations
 
+import hashlib
 from io import StringIO
 from threading import Event, Thread
 
 import pytest
+from conftest import make_call
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import CompleteEvent
 from prompt_toolkit.document import Document
 from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
+from prompt_toolkit.shortcuts import CompleteStyle
 from rich.console import Console
 
 from localloop.interactive import (
+    COMMAND_MENU_ROWS,
     COMMANDS,
     InteractiveShell,
     SlashCommandCompleter,
@@ -34,9 +38,10 @@ class FakeProvider:
         answer = self.answers.pop(0)
         if isinstance(answer, BaseException):
             raise answer
-        for character in answer:
+        turn = answer if isinstance(answer, AssistantTurn) else AssistantTurn(answer)
+        for character in turn.content:
             on_text_delta(character)
-        return AssistantTurn(answer)
+        return turn
 
 
 class ScriptedPrompt:
@@ -80,7 +85,7 @@ def test_prompt_only_enables_menu_space_for_command_prefix(tmp_path):
         workspace=tmp_path,
     )
     shell = InteractiveShell(config, provider_factory=lambda _config: FakeProvider())
-    assert shell.prompt_session.reserve_space_for_menu == len(COMMANDS)
+    assert shell.prompt_session.reserve_space_for_menu == COMMAND_MENU_ROWS
     assert _is_command_prefix("") is False
     assert _is_command_prefix("普通任务") is False
     assert _is_command_prefix("/") is True
@@ -125,7 +130,7 @@ def test_real_prompt_session_renders_commands_and_executes_selection():
 
         def write(self, data):
             self.parts.append(data)
-            if "/quit" in "".join(self.parts):
+            if "/help" in "".join(self.parts):
                 self.menu_rendered.set()
 
         write_raw = write
@@ -138,7 +143,8 @@ def test_real_prompt_session_renders_commands_and_executes_selection():
             completer=SlashCommandCompleter(),
             key_bindings=_command_key_bindings(),
             complete_while_typing=_complete_commands_while_typing(),
-            reserve_space_for_menu=len(COMMANDS),
+            complete_style=CompleteStyle.MULTI_COLUMN,
+            reserve_space_for_menu=COMMAND_MENU_ROWS,
         )
         result = []
         prompt_thread = Thread(target=lambda: result.append(session.prompt("› ")))
@@ -155,7 +161,8 @@ def test_real_prompt_session_renders_commands_and_executes_selection():
     assert not prompt_thread.is_alive()
     assert result == ["/help"]
     rendered = "".join(output.parts)
-    assert all(command.usage in rendered for command in COMMANDS)
+    missing = [command.usage for command in COMMANDS if command.usage not in rendered]
+    assert not missing, missing
 
 
 def make_shell(tmp_path, *, answers=None, prompts=None, auto=False, provider=None):
@@ -208,6 +215,69 @@ def test_interactive_shell_renders_streamed_text_once(tmp_path):
     rendered = output.getvalue()
     assert rendered.count("逐字输出成功。") == 1
     assert "已完成 · 1 步" in rendered
+
+
+def test_workspace_memory_commands_and_new_session_snapshot(tmp_path):
+    shell, provider, output = make_shell(
+        tmp_path,
+        answers=["第一轮。", "同一会话。", "新会话。"],
+    )
+    assert shell.handle_command("/remember 项目使用 C++17") is False
+    memory_id = shell.memory.list_active()[0].id
+    assert shell.handle_command("/memory") is False
+
+    shell.submit_task("补全 test.cpp")
+    assert "项目使用 C++17" in provider.requests[0][0][0]["content"]
+    assert shell.handle_command(f"/forget {memory_id}") is False
+    shell.submit_task("继续")
+    assert "项目使用 C++17" in provider.requests[1][0][0]["content"]
+
+    shell.handle_command("/new")
+    shell.submit_task("重新开始")
+    assert "项目使用 C++17" not in provider.requests[2][0][0]["content"]
+    rendered = output.getvalue()
+    assert "将在下一个新会话生效" in rendered
+    assert "已加载 1 条工作区记忆" in rendered
+    assert "当前会话的记忆快照不会改变" in rendered
+
+
+def test_interactive_creates_lists_and_undoes_checkpoint(tmp_path):
+    original = b"int main() {}\n"
+    target = tmp_path / "test.cpp"
+    target.write_bytes(original)
+    digest = hashlib.sha256(original).hexdigest()
+    provider = FakeProvider(
+        [
+            AssistantTurn(
+                "",
+                (
+                    make_call(
+                        "write_file",
+                        {
+                            "path": "test.cpp",
+                            "content": "int main() { return 0; }\n",
+                            "expected_sha256": digest,
+                        },
+                        "write",
+                    ),
+                ),
+            ),
+            AssistantTurn("修改完成。"),
+        ]
+    )
+    shell, _provider, output = make_shell(tmp_path, provider=provider)
+    shell.submit_task("补全 test.cpp")
+    assert target.read_text() == "int main() { return 0; }\n"
+    assert "已创建文件检查点" in output.getvalue()
+
+    assert shell.handle_command("/checkpoints") is False
+    assert shell.handle_command("/undo") is False
+    assert target.read_bytes() == original
+    assert shell.session is None
+    rendered = output.getvalue()
+    assert "最近文件检查点" in rendered
+    assert "已撤销检查点" in rendered
+    assert "当前对话上下文已清空" in rendered
 
 
 def test_resume_replays_user_and_assistant_messages(tmp_path):

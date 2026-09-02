@@ -15,6 +15,7 @@ import tempfile
 from collections.abc import Callable
 from pathlib import Path
 
+from localloop.checkpoint import CheckpointError, CheckpointStore
 from localloop.types import ApprovalPolicy, JsonObject, ToolCall, ToolResult
 
 MAX_FILE_BYTES = 1_048_576
@@ -111,9 +112,15 @@ def _truncate(text: str, limit: int) -> tuple[str, bool]:
 
 
 class LocalTools:
-    def __init__(self, workspace: Path, policy: ApprovalPolicy) -> None:
+    def __init__(
+        self,
+        workspace: Path,
+        policy: ApprovalPolicy,
+        checkpoints: CheckpointStore | None = None,
+    ) -> None:
         self.workspace = workspace.resolve()
         self.policy = policy
+        self.checkpoints = checkpoints
         self.definitions = TOOL_DEFINITIONS
         self._handlers = {
             "list_files": self.list_files,
@@ -367,9 +374,11 @@ class LocalTools:
         resolved = self._validate_path(path)
         existed = resolved.exists()
         previous = ""
+        previous_raw: bytes | None = None
         previous_mode: int | None = None
         if existed:
             raw, previous = self._read_text(resolved)
+            previous_raw = raw
             actual_hash = hashlib.sha256(raw).hexdigest()
             if not expected_sha256:
                 raise ToolError("expected_sha256 is required when updating an existing file")
@@ -391,6 +400,16 @@ class LocalTools:
         preview, preview_truncated = _truncate(diff, 12_000)
         if not self.policy.approve("write_file", path, preview):
             raise ToolError("User denied file write")
+        if self.checkpoints is not None:
+            try:
+                self.checkpoints.capture_before(
+                    resolved,
+                    previous=previous_raw,
+                    new_content=encoded,
+                    previous_mode=previous_mode,
+                )
+            except CheckpointError as exc:
+                raise ToolError(f"无法创建文件检查点：{exc}") from exc
         resolved.parent.mkdir(parents=True, exist_ok=True)
         temp_name: str | None = None
         try:

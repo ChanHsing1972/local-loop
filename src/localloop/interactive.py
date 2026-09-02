@@ -24,7 +24,9 @@ from rich.table import Table
 from rich.text import Text
 
 from localloop.agent import AgentEngine, create_new_session, resume_session
+from localloop.checkpoint import CheckpointError, CheckpointStore
 from localloop.context import ContextManager
+from localloop.memory import WorkspaceMemoryError, WorkspaceMemoryStore
 from localloop.provider import OpenAIChatProvider, ProviderError, probe_models
 from localloop.session import SessionError, SessionStore
 from localloop.tools import InteractiveApprovalPolicy, LocalTools
@@ -45,6 +47,11 @@ COMMANDS = (
     CommandSpec("/resume", "/resume ID", "恢复指定会话"),
     CommandSpec("/sessions", "/sessions", "列出最近会话"),
     CommandSpec("/delete", "/delete ID", "删除指定会话记录"),
+    CommandSpec("/remember", "/remember TEXT", "保存一条工作区记忆（下个新会话生效）"),
+    CommandSpec("/memory", "/memory", "查看当前工作区记忆"),
+    CommandSpec("/forget", "/forget ID", "遗忘指定工作区记忆"),
+    CommandSpec("/checkpoints", "/checkpoints", "列出最近文件检查点"),
+    CommandSpec("/undo", "/undo", "撤销最近一次 LocalLoop 文件写入"),
     CommandSpec("/models", "/models", "从网关获取可用模型"),
     CommandSpec("/model", "/model ID", "切换当前交互会话使用的模型"),
     CommandSpec("/approval", "/approval ask|auto", "切换逐次确认或自动批准"),
@@ -52,6 +59,7 @@ COMMANDS = (
     CommandSpec("/exit", "/exit", "退出 LocalLoop"),
     CommandSpec("/quit", "/quit", "退出 LocalLoop（/exit 的别名）"),
 )
+COMMAND_MENU_ROWS = len(COMMANDS) + 1  # 额外一行供 prompt-toolkit 绘制滚动区域。
 
 
 class SlashCommandCompleter(Completer):
@@ -157,14 +165,19 @@ class InteractiveShell:
             raise SessionError("输入历史文件不能是符号链接")
         history_path.touch(mode=0o600, exist_ok=True)
         os.chmod(history_path, 0o600)
+        try:
+            self.memory = WorkspaceMemoryStore(config.workspace)
+            self.checkpoints = CheckpointStore(config.workspace)
+        except (WorkspaceMemoryError, CheckpointError) as exc:
+            raise SessionError(str(exc)) from exc
         self.prompt_session = prompt_session or PromptSession(
             history=FileHistory(str(history_path)),
             completer=SlashCommandCompleter(),
             key_bindings=_command_key_bindings(),
             complete_while_typing=_complete_commands_while_typing(),
-            complete_style=CompleteStyle.COLUMN,
+            complete_style=CompleteStyle.MULTI_COLUMN,
             # 只有上面的动态条件成立或菜单已打开时，prompt-toolkit 才使用这些行。
-            reserve_space_for_menu=len(COMMANDS),
+            reserve_space_for_menu=COMMAND_MENU_ROWS,
             style=Style.from_dict(
                 {
                     "prompt": "ansicyan bold",
@@ -188,12 +201,12 @@ class InteractiveShell:
                 base_url=self.config.base_url,
                 model=self.config.model,
             )
-        policy = InteractiveApprovalPolicy(
+        self.approval_policy = InteractiveApprovalPolicy(
             auto_approve=self.config.auto_approve,
             input_fn=self.approval_input,
             output_fn=self._approval_output,
         )
-        tools = LocalTools(self.config.workspace, policy)
+        tools = LocalTools(self.config.workspace, self.approval_policy, self.checkpoints)
         self.engine = AgentEngine(
             provider=provider,
             tools=tools,
@@ -247,20 +260,29 @@ class InteractiveShell:
         self.console.print("直接输入编程任务；输入 [cyan]/help[/cyan] 查看命令。")
 
     def submit_task(self, task: str) -> None:
+        checkpoint = None
         try:
             if self.session is None or self.messages is None:
+                memories = self.memory.list_active()
                 self.session, self.messages = create_new_session(
                     workspace=self.config.workspace,
                     task=task,
                     model=self.config.model,
+                    workspace_memory=memories,
                 )
                 self.console.print(f"新会话：[cyan]{self.session.session_id}[/cyan]")
+                if memories:
+                    self.console.print(f"已加载 {len(memories)} 条工作区记忆。", style="dim cyan")
             else:
                 message: Message = {"role": "user", "content": task}
                 self.messages.append(message)
                 self.session.append_message(message)
-            result = self.engine.run(self.messages, self.session)
-        except (SessionError, ValueError) as exc:
+            self.checkpoints.begin(session_id=self.session.session_id, task=task)
+            try:
+                result = self.engine.run(self.messages, self.session)
+            finally:
+                checkpoint = self.checkpoints.finish()
+        except (SessionError, WorkspaceMemoryError, CheckpointError, ValueError) as exc:
             self.console.print(f"会话错误：{exc}", style="bold red")
             return
         label = _STATUS_LABELS[result.status]
@@ -272,6 +294,12 @@ class InteractiveShell:
         if result.status is not RunStatus.COMPLETED:
             error_style = "bold red" if result.status is RunStatus.ERROR else "yellow"
             self.console.print(result.final_output, style=error_style)
+        if checkpoint:
+            self.console.print(
+                f"已创建文件检查点 [cyan]{checkpoint.id}[/cyan]，记录 "
+                f"{len(checkpoint.files)} 个文件；输入 [cyan]/undo[/cyan] 可撤销。",
+                style="green",
+            )
 
     def handle_command(self, line: str) -> bool:
         command, _, argument = line.partition(" ")
@@ -299,6 +327,16 @@ class InteractiveShell:
                 self.console.print("用法：/delete 会话编号", style="yellow")
             else:
                 self._delete_session(argument)
+        elif command == "/remember":
+            self._remember(argument)
+        elif command == "/memory":
+            self._show_memory()
+        elif command == "/forget":
+            self._forget(argument)
+        elif command == "/checkpoints":
+            self._show_checkpoints()
+        elif command == "/undo":
+            self._undo_latest()
         elif command == "/models":
             self._show_models()
         elif command == "/model":
@@ -410,6 +448,88 @@ class InteractiveShell:
             self.session = None
             self.messages = None
         self.console.print(f"已删除会话 [cyan]{session_id}[/cyan]。", style="green")
+
+    def _remember(self, text: str) -> None:
+        if not text:
+            self.console.print("用法：/remember 要长期保存的项目约定", style="yellow")
+            return
+        try:
+            entry = self.memory.remember(text)
+        except WorkspaceMemoryError as exc:
+            self.console.print(f"无法保存记忆：{exc}", style="bold red")
+            return
+        self.console.print(
+            f"已保存工作区记忆 [cyan]{entry.id}[/cyan]；将在下一个新会话生效。",
+            style="green",
+        )
+
+    def _show_memory(self) -> None:
+        try:
+            entries = self.memory.list_active()
+        except WorkspaceMemoryError as exc:
+            self.console.print(f"无法读取记忆：{exc}", style="bold red")
+            return
+        if not entries:
+            self.console.print("当前工作区还没有记忆。", style="dim")
+            return
+        table = Table(title="工作区记忆")
+        table.add_column("编号", style="cyan", no_wrap=True)
+        table.add_column("内容")
+        for entry in entries:
+            table.add_row(entry.id, entry.text)
+        self.console.print(table)
+
+    def _forget(self, memory_id: str) -> None:
+        if not memory_id:
+            self.console.print("用法：/forget 记忆编号", style="yellow")
+            return
+        try:
+            entry = self.memory.forget(memory_id)
+        except WorkspaceMemoryError as exc:
+            self.console.print(f"无法遗忘记忆：{exc}", style="bold red")
+            return
+        self.console.print(
+            f"已遗忘工作区记忆 [cyan]{entry.id}[/cyan]；当前会话的记忆快照不会改变。",
+            style="green",
+        )
+
+    def _show_checkpoints(self) -> None:
+        try:
+            checkpoints = self.checkpoints.list_checkpoints()
+        except CheckpointError as exc:
+            self.console.print(f"无法读取检查点：{exc}", style="bold red")
+            return
+        if not checkpoints:
+            self.console.print("当前工作区还没有文件检查点。", style="dim")
+            return
+        labels = {"completed": "可撤销", "in_progress": "中断", "restored": "已撤销"}
+        table = Table(title="最近文件检查点")
+        table.add_column("编号", style="cyan", no_wrap=True)
+        table.add_column("状态", no_wrap=True)
+        table.add_column("任务")
+        table.add_column("文件")
+        for checkpoint in checkpoints:
+            table.add_row(
+                checkpoint.id,
+                labels.get(checkpoint.status, checkpoint.status),
+                checkpoint.task[:48],
+                ", ".join(checkpoint.files),
+            )
+        self.console.print(table)
+
+    def _undo_latest(self) -> None:
+        try:
+            checkpoint = self.checkpoints.undo_latest(self.approval_policy)
+        except CheckpointError as exc:
+            self.console.print(f"无法撤销：{exc}", style="yellow")
+            return
+        self.session = None
+        self.messages = None
+        self.console.print(
+            f"已撤销检查点 [cyan]{checkpoint.id}[/cyan]，恢复 {len(checkpoint.files)} 个文件。",
+            style="green",
+        )
+        self.console.print("当前对话上下文已清空；下一条输入会创建新会话。", style="dim")
 
     def _show_models(self) -> None:
         self.console.print("正在查询模型…", style="dim cyan")

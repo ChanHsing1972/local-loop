@@ -8,6 +8,7 @@ import time
 from collections.abc import Callable, Iterable
 
 from localloop.context import ContextBudgetError, ContextManager
+from localloop.memory import MemoryEntry, memory_prompt
 from localloop.provider import ProviderError
 from localloop.session import SessionStore
 from localloop.tools import LocalTools
@@ -288,13 +289,20 @@ def _append_failed_tool_results(
         session.append_message(message)
 
 
-def create_new_session(*, workspace, task: str, model: str) -> tuple[SessionStore, list[Message]]:
+def create_new_session(
+    *,
+    workspace,
+    task: str,
+    model: str,
+    workspace_memory: list[MemoryEntry] | None = None,
+) -> tuple[SessionStore, list[Message]]:
     clean_task = task.strip()
     if not clean_task:
         raise ValueError("任务不能为空")
     store = SessionStore.create(workspace, task=clean_task, model=model)
+    system_prompt = SYSTEM_PROMPT + memory_prompt(workspace_memory or [])
     messages: list[Message] = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": clean_task},
     ]
     for message in messages:
